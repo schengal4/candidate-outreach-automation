@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Sent list — {{ c.name }}{% endblock %}
+{% block content %}
+<h2>Sent list — {{ c.name }}</h2>
+<p class="muted">
+  Entries here block new outreach for {{ c.retention_months }} months: the
+  company won't resurface in discovery on new runs, and the contact's email is
+  never reused (exact match). Entries are editable at any time. If a contact
+  asks not to be contacted again, set <strong>Never contact</strong> — it
+  blocks them forever, regardless of the retention window, and survives pruning.
+</p>
+
+{% if entries %}
+<table>
+  <thead>
+    <tr>
+      <th>Company domain</th><th>Contact</th><th>Email</th><th>Date sent</th>
+      <th>Sent?</th><th>Interview arranged</th><th>Never contact</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+    <tr>
+      <td>{{ e.company_domain }}</td>
+      <td>{{ e.contact_name }}</td>
+      <td>
+        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+          <input class="inline-input" name="contact_email" value="{{ e.contact_email }}">
+      </td>
+      <td>
+          <input class="inline-input" name="date_sent" value="{{ e.date_sent }}" size="10">
+          <input type="hidden" name="action" value="save">
+          <button class="secondary outline" style="padding:.2rem .5rem">Save</button>
+        </form>
+      </td>
+      <td>
+        {% if e.confirmed_sent %}<span class="ok">✓</span>
+        {% else %}
+        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+          <input type="hidden" name="action" value="confirm_sent">
+          <button class="secondary outline" style="padding:.2rem .5rem">Confirm</button>
+        </form>
+        {% endif %}
+      </td>
+      <td>
+        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+          <input type="hidden" name="action" value="toggle_interview">
+          <button class="{{ '' if e.interview_arranged else 'secondary outline' }}" style="padding:.2rem .5rem">
+            {{ "✓ Yes" if e.interview_arranged else "No" }}
+          </button>
+        </form>
+      </td>
+      <td>
+        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post"
+              {% if not e.permanently_excluded %}onsubmit="return confirm('Never contact {{ e.contact_email }} again, even after the retention window? You can undo this later.')"{% endif %}>
+          <input type="hidden" name="action" value="toggle_permanent">
+          <button class="{{ '' if e.permanently_excluded else 'secondary outline' }}" style="padding:.2rem .5rem">
+            {{ "⛔ Never" if e.permanently_excluded else "No" }}
+          </button>
+        </form>
+      </td>
+      <td>
+        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post"
+              onsubmit="return confirm('{% if e.permanently_excluded %}This entry marks {{ e.contact_email }} as never-contact — removing it makes them reachable by future runs again. Remove anyway?{% else %}Remove this entry?{% endif %}')">
+          <input type="hidden" name="action" value="delete">
+          <button class="secondary outline" style="padding:.2rem .5rem">✕</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<form action="/sent/{{ c.id }}/prune" method="post">
+  <button class="secondary">Prune entries past the {{ c.retention_months }}-month window</button>
+</form>
+{% else %}
+<p class="muted">No entries yet — drafts add entries here automatically.</p>
+{% endif %}
+
+<h3>Add an entry manually</h3>
+<p class="muted">
+  For someone you reached outside this app (LinkedIn, in person, another tool) —
+  adding them here keeps future runs from resurfacing them during the retention window.
+</p>
+<form action="/sent/{{ c.id }}/add" method="post">
+  <div class="grid">
+    <input name="contact_email" type="email" placeholder="Contact email (required)" required>
+    <input name="contact_name" placeholder="Contact name">
+    <input name="company_domain" placeholder="Company domain (e.g. acme.com)">
+    <input name="date_sent" type="date" aria-label="Date contacted (defaults to today)">
+  </div>
+  <label>
+    <input type="checkbox" name="permanently_excluded" value="true">
+    Never contact again (they asked not to be contacted — overrides the retention window forever)
+  </label>
+  <button type="submit">Add to sent list</button>
+</form>
+
+<p><a href="/candidates/{{ c.id }}">← Back to {{ c.name }}</a></p>
+{% endblock %}

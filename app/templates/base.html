@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Candidate Outreach{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+  <style>
+    .drop { color: var(--pico-del-color); }
+    .ok { color: var(--pico-ins-color); }
+    .flag { background: #fff3cd; border-left: 4px solid #d97706; padding: .5rem .75rem; margin: .5rem 0; }
+    pre.email { white-space: pre-wrap; background: var(--pico-card-background-color); padding: 1rem; border-radius: .5rem; }
+    .muted { color: var(--pico-muted-color); font-size: .9em; }
+    td form { margin: 0; display: inline; }
+    .inline-input { width: auto; display: inline-block; padding: .2rem .4rem; height: auto; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <nav>
+      <ul><li><strong><a href="/">Candidate Outreach</a></strong></li></ul>
+      {% if request.session.get("user_email") %}
+      <ul>
+        <li class="muted">{{ request.session.get("user_name") or request.session.get("user_email") }}</li>
+        <li>
+          <form action="/logout" method="post" style="margin: 0;">
+            <button class="secondary outline" style="padding: .2rem .6rem;">Sign out</button>
+          </form>
+        </li>
+      </ul>
+      {% endif %}
+    </nav>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    function copyText(id, btn) {
+      const el = document.getElementById(id);
+      navigator.clipboard.writeText(el.innerText).then(() => {
+        const old = btn.innerText; btn.innerText = "Copied!";
+        setTimeout(() => btn.innerText = old, 1500);
+      });
+    }
+  </script>
+</body>
+</html>

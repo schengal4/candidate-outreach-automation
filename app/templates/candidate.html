@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ c.name }} — Candidate Outreach{% endblock %}
+{% block content %}
+<h2>{{ c.name }}</h2>
+<p class="muted">
+  Current employer (excluded): <strong>{{ c.current_employer }}</strong>
+  &nbsp;·&nbsp; {{ c.max_companies }} companies/run
+  &nbsp;·&nbsp; retention {{ c.retention_months }} mo
+  &nbsp;·&nbsp; red-flag detection {{ "on" if c.red_flag_detection else "off" }}
+</p>
+
+{% if pending %}
+<article class="flag">
+  <strong>Did you send to these?</strong>
+  <p class="muted">These entries were added to your Sent List when drafts were generated,
+     but you haven't confirmed sending them yet.</p>
+  <ul>
+    {% for e in pending %}
+    <li>{{ e.contact_name }} — {{ e.company_domain }} ({{ e.date_sent }})</li>
+    {% endfor %}
+  </ul>
+  <div class="grid">
+    <form action="/sent/{{ c.id }}/confirm_all" method="post">
+      <button type="submit">Yes — I sent all of these</button>
+    </form>
+    <a href="/sent/{{ c.id }}" role="button" class="secondary">Review sent list</a>
+  </div>
+</article>
+{% endif %}
+
+{% if c.career_goals %}<p><strong>Goals:</strong> {{ c.career_goals }}</p>{% endif %}
+{% if c.target_industry_role %}<p><strong>Target:</strong> {{ c.target_industry_role }}</p>{% endif %}
+
+<details {% if not c.draft_instructions %}open{% endif %}>
+  <summary><strong>Email drafting instructions / template</strong>
+    {% if c.draft_instructions %}<span class="ok">✓ set</span>{% else %}<span class="muted">(none yet — optional)</span>{% endif %}
+  </summary>
+  <form action="/candidates/{{ c.id }}/draft_instructions" method="post">
+    <textarea name="draft_instructions" rows="6"
+              placeholder="Style preferences, phrases to use or avoid, or paste a template to follow. Applied to every drafted email for this candidate from the next run onward.">{{ c.draft_instructions }}</textarea>
+    <p class="muted" style="margin-bottom:.5rem">
+      Where these conflict with the built-in style rules, yours win. Hard rules still apply:
+      no false claims, real names only, and the plain sign-off is appended automatically.
+    </p>
+    <button type="submit" class="secondary">Save instructions</button>
+  </form>
+</details>
+
+<article>
+  <strong>Gmail</strong>
+  {% if gmail_connected %}
+    <p class="ok">Connected — generated drafts can be saved to your Gmail Drafts folder.</p>
+    <form action="/candidates/{{ c.id }}/gmail/disconnect" method="post"
+          onsubmit="return confirm('Disconnect Gmail? This revokes the app\'s access to your account.')">
+      <button type="submit" class="secondary outline">Disconnect Gmail</button>
+    </form>
+  {% else %}
+    <p class="muted">Not connected. Connect your Gmail to save generated drafts directly to your account
+       (drafts only — nothing is ever sent automatically).</p>
+    <a href="/candidates/{{ c.id }}/gmail/connect" role="button">Connect Gmail</a>
+  {% endif %}
+</article>
+
+<form action="/candidates/{{ c.id }}/runs" method="post">
+  <button type="submit">Start outreach run</button>
+</form>
+<p class="muted">A run discovers companies, then pauses for your review before any contact research happens.</p>
+
+{% if past_runs %}
+<h3>Runs</h3>
+<p class="muted">Runs survive server restarts — finished drafts are kept, and a
+   run waiting at the review gate can still be approved. The
+   {{ past_runs | length }} most recent are kept per profile.</p>
+<table>
+  <thead><tr><th>Started</th><th>Status</th><th>Drafts</th><th></th></tr></thead>
+  <tbody>
+    {% for r in past_runs %}
+    <tr>
+      <td>{{ r.when }}</td>
+      <td>{{ r.phase }}</td>
+      <td>{{ r.drafts }}{% if r.companies %} / {{ r.companies }}{% endif %}</td>
+      <td><a href="/runs/{{ r.id }}">Open</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<p><a href="/sent/{{ c.id }}">View sent list</a></p>
+
+<details>
+  <summary>Resume text (as parsed)</summary>
+  <pre class="email">{{ c.resume_text }}</pre>
+</details>
+
+<details>
+  <summary class="muted">Danger zone</summary>
+  <form action="/candidates/{{ c.id }}/delete" method="post"
+        onsubmit="return confirm('Delete this profile permanently? This removes the resume, the Gmail connection (revoked at Google), and the entire sent list — including any Never-contact exclusions. This cannot be undone.')">
+    <button type="submit" class="secondary outline">Delete this profile</button>
+  </form>
+</details>
+{% endblock %}

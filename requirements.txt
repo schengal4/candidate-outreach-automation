@@ -1,0 +1,12 @@
+requests
+anthropic
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+python-docx
+google-auth
+google-auth-oauthlib
+google-api-python-client
+itsdangerous
+pywin32; sys_platform == "win32"

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+{# Signed-in accounts hold exactly one profile: with one candidate, "/"
+   redirects straight to it and this page is never seen. It renders only for
+   first-time setup (no profile yet), the legacy multiple-profiles state, or
+   open mode (REQUIRE_LOGIN=0), which is deliberately multi-candidate. #}
+{% if candidates %}
+<h2>Candidates</h2>
+{% if single_profile_mode %}
+<p class="muted">This account has more than one profile (from before profiles
+   were per-account). Each account is meant to hold one — open the extra
+   profile(s) and use "Delete this profile" to get down to one.</p>
+{% endif %}
+<table>
+  <thead><tr><th>Name</th><th>Current employer</th><th>Target</th><th></th></tr></thead>
+  <tbody>
+    {% for c in candidates %}
+    <tr>
+      <td><a href="/candidates/{{ c.id }}">{{ c.name }}</a></td>
+      <td>{{ c.current_employer }}</td>
+      <td>{{ c.target_industry_role or "—" }}</td>
+      <td><a href="/sent/{{ c.id }}">Sent list</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<h2>Set up your profile</h2>
+<p class="muted">Tell the app who you are and upload your resume — every
+   outreach run works from this one profile.</p>
+{% endif %}
+
+{% if not (single_profile_mode and candidates) %}
+{% if candidates %}<h3>New candidate</h3>{% endif %}
+<form action="/candidates" method="post" enctype="multipart/form-data">
+  <div class="grid">
+    <label>Name (required)
+      <input name="name" required placeholder="Jane Doe">
+    </label>
+    <label>Email (used in the email sign-off)
+      <input name="email" type="email" placeholder="jane@example.com">
+    </label>
+  </div>
+  <label>Resume (.docx, required)
+    <input type="file" name="resume" accept=".docx" required>
+  </label>
+  <label>Current employer (required — will never be targeted)
+    <input name="current_employer" required placeholder="Acme Corp">
+  </label>
+  <label>LinkedIn profile URL (optional)
+    <input name="linkedin_url" placeholder="https://linkedin.com/in/...">
+  </label>
+  <label>Career goals (optional)
+    <textarea name="career_goals" rows="2"></textarea>
+  </label>
+  <label>Culture preferences (optional)
+    <textarea name="culture_prefs" rows="2"></textarea>
+  </label>
+  <label>Target industry / role (optional)
+    <input name="target_industry_role" placeholder="e.g. Senior Data Engineer, fintech">
+  </label>
+  <label>Email drafting instructions or template (optional — editable later from the candidate page)
+    <textarea name="draft_instructions" rows="4"
+              placeholder="Style preferences, phrases to use or avoid, or paste a template to follow. Drafts still stick to the built-in rules: no false claims, real names only, sign-off added automatically."></textarea>
+  </label>
+  <div class="grid">
+    <label>Companies per run (max {{ defaults.hard_cap }})
+      <input type="number" name="max_companies" value="{{ defaults.max_companies }}" min="1" max="{{ defaults.hard_cap }}">
+    </label>
+    <label>Sent-list retention (months, {{ defaults.retention_min }}–{{ defaults.retention_max }})
+      <input type="number" name="retention_months" value="{{ defaults.retention }}" min="{{ defaults.retention_min }}" max="{{ defaults.retention_max }}">
+    </label>
+  </div>
+  <label>
+    <input type="checkbox" name="red_flag_detection" value="true">
+    Enable red-flag detection (scam signals &amp; concerning social media indicators — off by default)
+  </label>
+  <button type="submit">{{ "Create candidate" if candidates else "Create my profile" }}</button>
+</form>
+{% endif %}
+{% endblock %}

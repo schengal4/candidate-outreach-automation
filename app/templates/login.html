@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Sign in — Candidate Outreach{% endblock %}
+{% block content %}
+<article style="max-width: 28rem; margin: 4rem auto; text-align: center;">
+  <h2>Sign in</h2>
+  <p class="muted">
+    This app holds candidate resumes, contact research, and email drafts —
+    sign in with Google to continue.
+  </p>
+  {% if error %}
+  <p class="drop">{{ error }}</p>
+  {% endif %}
+  <a href="/auth/login" role="button">Sign in with Google</a>
+  <p class="muted" style="margin-top: 1rem; font-size: .8em;">
+    Signing in only shares your name and email address with this app.
+    It is separate from the per-candidate Gmail drafts connection.
+  </p>
+</article>
+{% endblock %}

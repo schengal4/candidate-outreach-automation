@@ -1,0 +1,141 @@
+{# Polled partial — renders according to run phase. #}
+
+{% if run.phase == "discovering" %}
+<p aria-busy="true">Discovering target companies with web research… this can take a couple of minutes.</p>
+<p class="muted">{{ run.activity or "Starting up…" }}</p>
+
+{% elif run.phase == "review" %}
+<h3>Review the shortlist</h3>
+<p>Uncheck any company you want to exclude. Only approved companies continue to contact research.</p>
+<form action="/runs/{{ run.id }}/approve" method="post">
+  <table>
+    <thead><tr><th></th><th>Company</th><th>Domain</th><th>Why</th></tr></thead>
+    <tbody>
+      {% for comp in run.discovered %}
+      <tr>
+        <td><input type="checkbox" name="approved" value="{{ comp.domain }}" checked></td>
+        <td>{{ comp.name }}</td>
+        <td class="muted">{{ comp.domain }}</td>
+        <td class="muted">{{ comp.reason }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <button type="submit">Approve &amp; continue</button>
+</form>
+
+{% elif run.phase == "running" %}
+<p aria-busy="true">Running the pipeline — contact identification → email lookup → research → drafting.</p>
+{% set done_count = run.companies | selectattr("status", "equalto", "done") | list | length %}
+{% set dropped_count = run.companies | selectattr("status", "equalto", "dropped") | list | length %}
+<p class="muted">{{ done_count + dropped_count }} of {{ run.companies | length }} companies finished.</p>
+
+{% if show_timeout_button %}
+<form action="/runs/{{ run.id }}/stop_early" method="post">
+  <button type="submit" class="secondary">Stop now &amp; view emails completed so far</button>
+</form>
+<p class="muted">This run stops automatically after 30 minutes either way.</p>
+{% endif %}
+
+<table>
+  <thead><tr><th>Company</th><th>Status</th></tr></thead>
+  <tbody>
+    {% for comp in run.companies %}
+    <tr>
+      <td>{{ comp.name }}</td>
+      <td>
+        {% if comp.status == "done" %}<span class="ok">done</span>
+        {% elif comp.status == "dropped" %}<span class="drop">dropped — {{ comp.drop_reason }}</span>
+        {% else %}
+          {{ comp.status }}…
+          {% if comp.activity %}<br><span class="muted">{{ comp.activity }}</span>{% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% elif run.phase == "error" %}
+<article class="drop"><strong>Run failed:</strong> {{ run.error }}</article>
+
+{% elif run.phase == "done" %}
+{% set s = run.summary() %}
+<h3>Run report</h3>
+<ul>
+  <li>Companies attempted: <strong>{{ s.attempted }}</strong>
+      {% if s.excluded_at_review %} <span class="muted">({{ s.excluded_at_review }} excluded by you at review)</span>{% endif %}</li>
+  <li>Contacts found: <strong>{{ s.contacts_found }}</strong></li>
+  <li>Drafts generated: <strong>{{ s.drafts }}</strong></li>
+  <li>Dropped: <strong>{{ s.dropped | length }}</strong>
+    {% if s.dropped %}
+    <ul>{% for d in s.dropped %}<li class="muted">{{ d.name }} — {{ d.drop_reason }}</li>{% endfor %}</ul>
+    {% endif %}
+  </li>
+</ul>
+<p class="muted">All drafts below were added to the <a href="/sent/{{ c.id }}">Sent List</a>.
+   Next time you open the app you'll be asked to confirm which ones you actually sent.</p>
+
+{% for comp in run.companies %}
+{% if comp.status == "done" %}
+<article>
+  <header>
+    <strong>{{ comp.name }}</strong> <span class="muted">({{ comp.domain }})</span><br>
+    {{ comp.contact_used.full_name }} — {{ comp.contact_used.title }}
+    {% if comp.contact_used.linkedin_url %}
+      · <a href="{{ comp.contact_used.linkedin_url }}" target="_blank">LinkedIn</a>
+    {% endif %}
+    <br><span class="muted">Email: {{ comp.email }}
+      {% if comp.email_score is not none %}(Hunter score {{ comp.email_score }}){% endif %}</span>
+  </header>
+
+  {% if comp.red_flags %}
+  <div class="flag">
+    <strong>⚠ Red flags found — review before sending. Your call.</strong>
+    <ul>{% for f in comp.red_flags %}<li>{{ f }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <details>
+    <summary>Employment evidence &amp; research</summary>
+    <p><strong>Evidence:</strong> {{ comp.contact_used.evidence }}</p>
+    <p><strong>Research:</strong> {{ comp.research_summary }}</p>
+    {% if comp.research_items %}
+    <ul>{% for item in comp.research_items %}<li>{{ item }}</li>{% endfor %}</ul>
+    {% endif %}
+  </details>
+
+  <p><strong>Subject:</strong> <span id="subj-{{ loop.index }}">{{ comp.draft_subject }}</span>
+     <button class="secondary outline" style="padding:.2rem .6rem" onclick="copyText('subj-{{ loop.index }}', this)">Copy</button></p>
+  <pre class="email" id="body-{{ loop.index }}">{{ comp.draft_body }}</pre>
+  <button onclick="copyText('body-{{ loop.index }}', this)">Copy email body</button>
+
+  {% if gmail_connected %}
+  <p>
+    {% if comp.gmail_draft_created %}
+      <span class="ok">✓ Saved to Gmail Drafts</span>
+    {% else %}
+      <form action="/runs/{{ run.id }}/companies/{{ loop.index0 }}/save_to_gmail" method="post" style="display:inline">
+        <button type="submit" class="secondary">Save to Gmail</button>
+      </form>
+      {% if comp.gmail_error %}<br><span class="drop">Gmail error: {{ comp.gmail_error }}</span>{% endif %}
+    {% endif %}
+  </p>
+  {% endif %}
+</article>
+{% endif %}
+{% endfor %}
+
+{# Batch save — placed after the drafts so they've all been on screen before the
+   one explicit click. Kept alongside (not instead of) the per-draft buttons:
+   reviewing each draft's factual claims first is still the point. #}
+{% if gmail_connected %}
+{% set unsaved = run.companies | selectattr("status", "equalto", "done")
+                               | rejectattr("gmail_draft_created") | list %}
+{% if unsaved | length > 1 %}
+<form action="/runs/{{ run.id }}/save_all_to_gmail" method="post">
+  <button type="submit">Save all {{ unsaved | length }} remaining drafts to Gmail</button>
+</form>
+{% endif %}
+{% endif %}
+{% endif %}

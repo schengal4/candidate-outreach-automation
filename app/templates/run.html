@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Run — Candidate Outreach{% endblock %}
+{% block content %}
+<h2>Outreach run for {{ c.name }}</h2>
+<p class="muted">Elapsed: <span id="elapsed">0s</span></p>
+<div id="panel" hx-get="/runs/{{ run.id }}/panel" hx-trigger="load, every 3s" hx-swap="innerHTML">
+  <p aria-busy="true">Loading…</p>
+</div>
+<script>
+  (function () {
+    var start = performance.now();
+    var el = document.getElementById("elapsed");
+    setInterval(function () {
+      el.textContent = Math.round((performance.now() - start) / 1000) + "s";
+    }, 1000);
+  })();
+</script>
+{% endblock %}

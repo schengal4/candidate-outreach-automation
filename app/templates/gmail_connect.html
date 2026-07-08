@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Connect Gmail — {{ c.name }}{% endblock %}
+{% block content %}
+<h2>Connect Gmail</h2>
+<p>Before you continue to Google, here's exactly what this does:</p>
+<ul>
+  <li>The app will be able to <strong>create draft emails</strong> in your Gmail account —
+      one draft per generated outreach email, addressed to the contact found for each company.</li>
+  <li>It <strong>cannot and will not send anything automatically</strong>. Every draft sits in your
+      Drafts folder until you personally review and send it from Gmail.</li>
+  <li>It cannot read your inbox, your contacts, or any existing mail.</li>
+  <li>You can disconnect at any time from this candidate's page — that revokes access at Google,
+      not just locally.</li>
+</ul>
+<p class="muted">Google's own consent screen will show next. It lists the same "compose drafts" permission.</p>
+<div class="grid">
+  <a href="/candidates/{{ c.id }}/gmail/authorize" role="button">Continue to Google</a>
+  <a href="/candidates/{{ c.id }}" role="button" class="secondary">Cancel</a>
+</div>
+{% endblock %}

@@ -1,0 +1,13 @@
+# Virtual environment
+.env/
+
+# Candidate data: resumes, sent lists, and Gmail OAuth tokens are all
+# personal/sensitive — never commit these. Same for the backups of it.
+data/
+data_backups/
+
+__pycache__/
+*.pyc
+
+# Per-machine Claude Code permissions — not project config
+.claude/settings.local.json
