@@ -10,6 +10,13 @@ RESUME_DIR = DATA_DIR / "resumes"
 DATA_DIR.mkdir(exist_ok=True)
 RESUME_DIR.mkdir(exist_ok=True)
 
+# Logging (see app/logging_setup.py): console + rotating file under data/logs/.
+# LOG_LEVEL takes the standard names — DEBUG, INFO, WARNING, ERROR. LOG_DIR is
+# overridable so the test runner can keep test noise out of the real log file.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+LOG_DIR = Path(os.environ.get("LOG_DIR") or (DATA_DIR / "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 # LLM
 ANTHROPIC_MODEL = "claude-sonnet-5"
 WEB_SEARCH_MAX_USES = 8
@@ -37,6 +44,14 @@ RUN_LAUNCH_JITTER_SECONDS = 5.0
 # per rolling 24 hours. Counted from persisted runs (run_store keeps at least
 # this many per candidate — see KEEP_RUNS_PER_CANDIDATE there).
 MAX_RUNS_PER_DAY = max(1, int(os.environ.get("MAX_RUNS_PER_DAY", "5")))
+
+# Safety valve for a single LLM call. Web-search-heavy contact searches have
+# run 20+ minutes as ONE streaming request on hard-to-verify companies (the
+# stream keeps delivering thinking, so no HTTP timeout ever fires) — bound
+# each call so a marathon company drops itself with a clear reason instead of
+# squatting until the run-wide timeout kills everything. Applies per request,
+# including its rate-limit retries.
+LLM_CALL_TIMEOUT_SECONDS = max(60, int(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", str(15 * 60))))
 
 # Long-running-pipeline safety valve. A "retrieve what's done" button appears
 # on the run page once a run has been in the RUNNING phase this long; the run

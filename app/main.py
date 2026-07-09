@@ -14,11 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
-# Configure once for the whole app (uvicorn's own loggers are separate).
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Configure once for the whole app (uvicorn's own loggers are separate) —
+# console + rotating file under data/logs/; see app/logging_setup.py.
+from .logging_setup import configure_logging
+
+configure_logging()
 logger = logging.getLogger("app.main")
 
 from fastapi import FastAPI, Form, Request, UploadFile
@@ -226,13 +226,17 @@ async def create_candidate(
     )
     atomic_write_bytes(resume_docx_path(candidate), data)
     storage.save_candidate(candidate)
+    logger.info("Created candidate %s (owner=%s)", candidate.id, candidate.owner_email or "-")
     # Cache the PDF render now (same file every draft, so convert once here,
     # not per-email). Best-effort: on failure, draft creation retries the
     # conversion and surfaces the error next to the draft instead.
     try:
         await asyncio.to_thread(ensure_resume_pdf, candidate)
     except Exception:
-        pass
+        logger.warning(
+            "Resume PDF pre-conversion failed for candidate %s (draft creation will retry)",
+            candidate.id, exc_info=True,
+        )
     return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
@@ -275,6 +279,7 @@ async def delete_candidate(request: Request, candidate_id: str):
     candidate = _owned_candidate(request, candidate_id)
     if not candidate:
         return _candidate_not_found()
+    logger.info("Deleting candidate %s and all associated data", candidate_id)
     # Best-effort revoke + token file removal; blocking network call to
     # Google (up to its 10s timeout) — keep it off the event loop.
     await asyncio.to_thread(gmail_client.disconnect, candidate_id)
@@ -332,8 +337,10 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
         # polls) don't freeze behind a slow Google response.
         user = await asyncio.to_thread(auth.handle_login_callback, code, state)
     except LoginError as exc:
+        logger.warning("Login failed: %s", exc)
         request.session["login_error"] = str(exc)
         return RedirectResponse("/login", status_code=303)
+    logger.info("Login: %s", user["email"])
     request.session["user_email"] = user["email"]
     request.session["user_name"] = user["name"]
     return RedirectResponse("/", status_code=303)
@@ -406,6 +413,10 @@ async def start_run(request: Request, candidate_id: str):
         if r.candidate_id == candidate_id and (time.time() - r.created_at) < 24 * 3600
     )
     if runs_today >= MAX_RUNS_PER_DAY:
+        logger.warning(
+            "Run refused for candidate %s: daily cap reached (%d/24h)",
+            candidate_id, MAX_RUNS_PER_DAY,
+        )
         return HTMLResponse(
             f"<p>Daily run limit reached ({MAX_RUNS_PER_DAY} per profile per 24 hours) — "
             f"each run costs real API money, so this is capped. Try again later. "
@@ -426,8 +437,19 @@ async def run_page(request: Request, run_id: str):
     run, candidate = _owned_run(request, run_id)
     if not run:
         return HTMLResponse("<p>Run not found. <a href='/'>Back</a></p>", status_code=404)
+    # True elapsed time of the run itself (the old counter measured time since
+    # the page loaded). Frozen once the run is finished; ticks while it works.
+    start = run.started_running_at or run.created_at
+    end = run.finished_at or time.time()
     return templates.TemplateResponse(
-        request, "run.html", {"run": run, "c": candidate}
+        request,
+        "run.html",
+        {
+            "run": run,
+            "c": candidate,
+            "elapsed": max(0, int(end - start)),
+            "ticking": run.phase in (RunPhase.DISCOVERING, RunPhase.RUNNING),
+        },
     )
 
 
@@ -463,6 +485,7 @@ async def stop_run_early(request: Request, run_id: str):
     pipeline short at the next check, keeping whatever already finished."""
     run, _ = _owned_run(request, run_id)
     if run and run.phase == RunPhase.RUNNING:
+        logger.info("Run %s: stop-early requested", run_id)
         run.stop_event.set()
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
@@ -479,6 +502,9 @@ async def save_to_gmail(request: Request, run_id: str, index: int):
             company.gmail_draft_created = True
             company.gmail_error = ""
         except Exception as exc:
+            logger.warning(
+                "Run %s: Gmail draft failed for %s: %s", run_id, company.name, exc
+            )
             company.gmail_error = str(exc)
         run_store.save_run(run)  # the saved-to-Gmail marks survive restarts too
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
@@ -499,6 +525,9 @@ async def save_all_to_gmail(request: Request, run_id: str):
                     company.gmail_draft_created = True
                     company.gmail_error = ""
                 except Exception as exc:
+                    logger.warning(
+                        "Run %s: Gmail draft failed for %s: %s", run_id, company.name, exc
+                    )
                     company.gmail_error = str(exc)
         run_store.save_run(run)  # the saved-to-Gmail marks survive restarts too
     return RedirectResponse(f"/runs/{run_id}", status_code=303)

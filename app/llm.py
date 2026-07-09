@@ -19,6 +19,7 @@ logger = logging.getLogger("app.llm")
 
 from .config import (
     ANTHROPIC_MODEL,
+    LLM_CALL_TIMEOUT_SECONDS,
     LLM_MAX_TOKENS,
     MAX_PAUSE_TURN_CONTINUATIONS,
     WEB_SEARCH_MAX_USES,
@@ -132,6 +133,7 @@ async def ask_json(
     label: str = "",
     cache_prefix: Optional[str] = None,
     effort: Optional[str] = None,
+    schema: Optional[dict] = None,
 ) -> Any:
     """One Claude request; returns the parsed JSON payload of the reply.
 
@@ -154,6 +156,12 @@ async def ask_json(
     which is rule-bound rather than open-ended. Leave unset (default "high")
     for anything where depth matters, like verifying employment or gathering
     personalization research.
+
+    `schema`, if given, is a JSON Schema enforced server-side via structured
+    outputs (output_config.format) — the reply text is then guaranteed valid
+    JSON matching it. Without it, replies occasionally carry an unescaped
+    quote or raw newline inside a JSON string and the parse below fails after
+    all the expensive upstream work has already been paid for.
     """
     client = get_client()
     tools: List[dict] = []
@@ -204,15 +212,31 @@ async def ask_json(
         )
         if tools:
             kwargs["tools"] = tools
+        output_config: dict = {}
         if effort:
-            kwargs["output_config"] = {"effort": effort}
+            output_config["effort"] = effort
+        if schema:
+            output_config["format"] = {"type": "json_schema", "schema": schema}
+        if output_config:
+            kwargs["output_config"] = output_config
         if container_id:
             # A pause_turn can leave pending tool use from a server-side code
             # execution container; the continuation must reuse the same
             # container or the API rejects it ("container_id is required...").
             kwargs["container"] = container_id
 
-        msg = await _send_request(client, kwargs, report)
+        # Hard per-call time limit (covers the stream and its rate-limit
+        # retries). Web-search calls on hard companies have run 20+ minutes
+        # as one request — better to drop that company with a clear reason
+        # than let it ride until the run-wide timeout kills the whole run.
+        try:
+            msg = await asyncio.wait_for(
+                _send_request(client, kwargs, report), timeout=LLM_CALL_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            raise LLMError(
+                f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS // 60} minutes."
+            )
 
         if msg.container:
             container_id = msg.container.id
@@ -239,6 +263,12 @@ async def ask_json(
             raise LLMError("Model output was truncated (max_tokens). Try again.")
 
         text = "".join(b.text for b in msg.content if b.type == "text")
-        return extract_json(text)
+        try:
+            return extract_json(text)
+        except LLMError:
+            # The LLMError message truncates the reply at 400 chars — keep the
+            # full text in the log so parse failures are actually diagnosable.
+            logger.warning("%s: unparseable model reply, full text:\n%s", label or "call", text)
+            raise
 
     raise LLMError("Model did not finish within the pause_turn continuation limit.")

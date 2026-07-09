@@ -192,6 +192,7 @@ Automatic_Email_Generation/
 |---|---|
 | `__init__.py` | Empty — just marks this folder as a Python package. Nothing to see here. |
 | `config.py` | All the tunable settings in one place: which Claude model to use, how many companies to research per run, rate limits, retention-window defaults. |
+| `logging_setup.py` | Wires up app-wide logging: everything the app logs goes to the console **and** a rotating file at `data/logs/app.log` (so a run's history survives closing the terminal). Set the `LOG_LEVEL` env var (`DEBUG`, `INFO`, `WARNING`, `ERROR`) to change verbosity; default is `INFO`. |
 | `models.py` | The "shapes" of the app's data — blank forms that get filled in as things run, e.g. what a Candidate looks like, what a Contact looks like, what a Run looks like. |
 | `resume.py` | Opens an uploaded `.docx` resume and pulls the plain text out of it so Claude can read it. Also owns where resume files live on disk and keeps a cached PDF copy for email attachments. |
 | `pdf_convert.py` | Converts the uploaded `.docx` resume to PDF using the locally installed MS Word (no LLM, no cloud service — a faithful render of the file). Windows-only; requires Word. |
@@ -220,7 +221,7 @@ Automatic_Email_Generation/
 
 | File/folder | What it does |
 |---|---|
-| `data/` | The app's storage — created automatically the first time you run it. Holds `candidates.json` (all saved candidate profiles), `resumes/` (uploaded resume files), `gmail_tokens/` (one OAuth token file per connected candidate), and one `sent_list_<id>.csv` per candidate. Gitignored. |
+| `data/` | The app's storage — created automatically the first time you run it. Holds `candidates.json` (all saved candidate profiles), `resumes/` (uploaded resume files), `gmail_tokens/` (one OAuth token file per connected candidate), one `sent_list_<id>.csv` per candidate, and `logs/` (the app's log files, rotated). Gitignored. |
 | `.gitignore` | Excludes `data/` (personal info + OAuth tokens) and the `.env/` virtualenv from git. |
 | `hunter_client.py` | Pre-existing helper that knows how to call the Hunter.io API directly (look up an email, verify one, etc.) — `app/hunter_async.py` wraps this so the web app can use it without blocking. |
 | `Hunter_API_Documentation.md` | Reference notes for the Hunter.io API. |

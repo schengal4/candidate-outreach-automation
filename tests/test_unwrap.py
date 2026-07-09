@@ -4,6 +4,7 @@ between paragraphs), and that it survives the actual Gmail MIME round-trip."""
 import base64
 import sys
 from email import message_from_bytes
+from email.policy import default
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 from app.pipeline import _unwrap_paragraphs
@@ -33,9 +34,11 @@ assert paragraphs[1] == (
 )
 print("PASS: hard-wrapped paragraphs collapse to single lines; blank-line breaks preserved")
 
-# Round-trip through the real MIME builder used for Gmail drafts.
+# Round-trip through the real MIME builder used for Gmail drafts. The message
+# is now multipart (plain + HTML alternative) — check the plain part.
 raw = _build_raw_message("elad@example.com", "Subject", unwrapped)
-msg = message_from_bytes(base64.urlsafe_b64decode(raw))
-body_text = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8")
+msg = message_from_bytes(base64.urlsafe_b64decode(raw), policy=default)
+plain = msg.get_body(preferencelist=("plain",))
+body_text = plain.get_content()
 assert body_text.strip() == unwrapped.strip(), "MIME round-trip altered the body text"
 print("PASS: unwrapped body survives the Gmail MIME message round-trip unchanged")

@@ -157,6 +157,8 @@ class RunState:
     companies: List[CompanyState] = field(default_factory=list)
     # set when phase -> RUNNING; drives the timeout-button / hard-timeout logic
     started_running_at: Optional[float] = None
+    # set when the run reaches DONE or ERROR; freezes the elapsed-time display
+    finished_at: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     # set by the "retrieve what's done" button to cut a RUNNING run short.
     # In-memory only — a persisted run that gets reloaded starts with a
@@ -178,6 +180,7 @@ class RunState:
             "discovered": self.discovered,
             "companies": [c.to_dict() for c in self.companies],
             "started_running_at": self.started_running_at,
+            "finished_at": self.finished_at,
             "created_at": self.created_at,
         }
 
@@ -190,6 +193,7 @@ class RunState:
         run.discovered = list(d.get("discovered", []))
         run.companies = [CompanyState.from_dict(cd) for cd in d.get("companies", [])]
         run.started_running_at = d.get("started_running_at")
+        run.finished_at = d.get("finished_at")  # absent in pre-feature run files
         run.created_at = float(d.get("created_at", time.time()))
         return run
 

@@ -2,16 +2,25 @@
 {% block title %}Run — Candidate Outreach{% endblock %}
 {% block content %}
 <h2>Outreach run for {{ c.name }}</h2>
-<p class="muted">Elapsed: <span id="elapsed">0s</span></p>
+<p class="muted">Elapsed: <span id="elapsed">{{ elapsed }}s</span></p>
 <div id="panel" hx-get="/runs/{{ run.id }}/panel" hx-trigger="load, every 3s" hx-swap="innerHTML">
   <p aria-busy="true">Loading…</p>
 </div>
 <script>
   (function () {
-    var start = performance.now();
+    // Server-computed run duration (not time-since-page-load); only keeps
+    // counting while the run is actually still working.
+    var elapsed = {{ elapsed }};
+    var ticking = {{ "true" if ticking else "false" }};
     var el = document.getElementById("elapsed");
+    function fmt(s) {
+      return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+    }
+    el.textContent = fmt(elapsed);
+    if (!ticking) return;
     setInterval(function () {
-      el.textContent = Math.round((performance.now() - start) / 1000) + "s";
+      elapsed += 1;
+      el.textContent = fmt(elapsed);
     }, 1000);
   })();
 </script>

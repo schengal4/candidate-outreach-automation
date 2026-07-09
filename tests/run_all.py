@@ -8,10 +8,17 @@ another. Exit code is nonzero if any file fails.
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
+
+# Tests import the real app modules, which configure the real rotating log
+# file — without this, every suite run dumps fake logins, test candidates,
+# and deliberate "kaboom" tracebacks into data/logs/app.log, where they read
+# as production failures. Point the whole suite at a throwaway directory.
+TEST_LOG_DIR = tempfile.mkdtemp(prefix="outreach-test-logs-")
 
 # Files that exercise routes without logging in — run with the wall down.
 NEEDS_OPEN_MODE = {"test_batch_save.py", "test_timeout_routes.py"}
@@ -31,6 +38,7 @@ def main() -> int:
     started = time.time()
     for f in files:
         env = dict(os.environ)
+        env["LOG_DIR"] = TEST_LOG_DIR
         if f.name in NEEDS_OPEN_MODE:
             env["REQUIRE_LOGIN"] = "0"
         result = subprocess.run(

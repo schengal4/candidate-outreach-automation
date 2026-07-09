@@ -5,6 +5,7 @@ semaphore caps concurrent Hunter calls across ALL company pipelines, per spec.
 """
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -15,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hunter_client import HunterAPIError, HunterClient  # noqa: E402
 
 from .config import HUNTER_CONCURRENCY, MIN_EMAIL_SCORE  # noqa: E402
+
+logger = logging.getLogger("app.hunter")
 
 _semaphore: Optional[asyncio.Semaphore] = None
 _client: Optional[HunterClient] = None
@@ -44,11 +47,18 @@ async def find_email(domain: str, first_name: str, last_name: str) -> Tuple[Opti
                 first_name=first_name,
                 last_name=last_name,
             )
-        except HunterAPIError:
+        except HunterAPIError as exc:
+            logger.warning("Hunter lookup failed for %s %s @ %s: %s", first_name, last_name, domain, exc)
             return None, None
     data = (result or {}).get("data") or {}
     email = data.get("email")
     score = data.get("score")
     if email and (score is None or score >= MIN_EMAIL_SCORE):
+        # The address itself stays out of the logs (it's in the run report).
+        logger.info("Hunter: email found @ %s (score=%s)", domain, score)
         return email, score
+    logger.info(
+        "Hunter: no confident email for %s %s @ %s (score=%s)",
+        first_name, last_name, domain, score,
+    )
     return None, None

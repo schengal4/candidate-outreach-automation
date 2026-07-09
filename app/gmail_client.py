@@ -18,7 +18,9 @@ Design notes (compliance-relevant):
 import asyncio
 import base64
 import json
+import logging
 from email.message import EmailMessage
+from html import escape
 from typing import Dict, Optional
 
 import requests
@@ -37,6 +39,8 @@ from .config import (
 from .fsutil import atomic_write_text
 from .models import Candidate, CompanyState
 from .resume import ensure_resume_pdf, resume_pdf_display_name
+
+logger = logging.getLogger("app.gmail")
 
 
 class GmailNotConfigured(Exception):
@@ -107,6 +111,7 @@ def handle_oauth_callback(code: str, candidate_id: str) -> None:
     )
     flow.fetch_token(code=code)
     _save_credentials(candidate_id, flow.credentials)
+    logger.info("Gmail connected for candidate %s", candidate_id)
 
 
 def _save_credentials(candidate_id: str, creds: Credentials) -> None:
@@ -137,10 +142,26 @@ def disconnect(candidate_id: str) -> None:
                 timeout=10,
             )
         except requests.RequestException:
-            pass  # best-effort — still remove the local copy below
+            # best-effort — still remove the local copy below
+            logger.warning(
+                "Gmail token revoke failed for candidate %s (removing local token anyway)",
+                candidate_id, exc_info=True,
+            )
     path = _token_path(candidate_id)
     if path.exists():
         path.unlink()
+        logger.info("Gmail disconnected for candidate %s", candidate_id)
+
+
+def _body_to_html(body: str) -> str:
+    """The draft body as minimal HTML: paragraphs as <p>, single line breaks
+    (the signature block) as <br>. Deliberately unstyled — it must read as a
+    personal, hand-written email, not a designed one."""
+    paragraphs = [
+        "<p>" + escape(p).replace("\n", "<br>") + "</p>"
+        for p in body.split("\n\n")
+    ]
+    return "<html><body>" + "".join(paragraphs) + "</body></html>"
 
 
 def _build_raw_message(
@@ -151,6 +172,12 @@ def _build_raw_message(
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg.set_content(body)
+    # HTML alternative alongside the plain text. A text/plain-only draft puts
+    # Gmail's composer in plain-text mode, and Gmail hard-wraps plain text at
+    # ~70 chars on SEND — the recipient then sees a narrow ragged column
+    # instead of reflowing prose. With an HTML part, Gmail composes and sends
+    # rich text, which reflows to the reader's pane width.
+    msg.add_alternative(_body_to_html(body), subtype="html")
     if attachment is not None:
         msg.add_attachment(
             attachment, maintype="application", subtype="pdf", filename=attachment_name
@@ -172,6 +199,7 @@ def _create_draft_sync(candidate: Candidate, to_addr: str, subject: str, body: s
         attachment=pdf_bytes, attachment_name=resume_pdf_display_name(candidate),
     )
     service.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
+    logger.info("Gmail draft created for candidate %s (subject: %s)", candidate.id, subject)
 
 
 async def create_draft(candidate: Candidate, company: CompanyState) -> None:
