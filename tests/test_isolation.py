@@ -10,12 +10,13 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 import app.auth as auth_mod
-from app import storage
+from app import config, storage
 from app.models import RunState, RunPhase
-from app.pipeline import RUNS
+from app.run_manager import manager
 from app.resume import resume_docx_path
 
-main.LOGIN_REQUIRED = True
+RUNS = manager.runs
+config.settings.LOGIN_REQUIRED = True
 OWNER = "venkatachengalvala@gmail.com"
 OTHER = "other.person@example.com"
 VENKATA_ID = "516e7c4751"
@@ -63,7 +64,7 @@ for path, method in [
 r = other_client.post(f"/candidates/{VENKATA_ID}/runs", follow_redirects=False)
 assert r.status_code == 404
 r = other_client.post(f"/sent/{VENKATA_ID}/add", data={"contact_email": "a@b.com"}, follow_redirects=False)
-assert r.status_code == 303  # redirects, but must not have written
+assert r.status_code == 404  # not-owned candidate is a 404, and must not have written
 assert all(e["contact_email"] != "a@b.com" for e in __import__("app.sent_list", fromlist=["x"]).load_entries(VENKATA_ID))
 r = other_client.post(f"/sent/{VENKATA_ID}/0/update", data={"action": "delete"}, follow_redirects=False)
 assert r.status_code == 404
@@ -108,7 +109,7 @@ finally:
         pdf.unlink()
 
 # --- Open mode preserves the original single-user behavior ---
-main.LOGIN_REQUIRED = False
+config.settings.LOGIN_REQUIRED = False
 open_client = TestClient(main.app)
 html = open_client.get("/").text
 assert "Venkata Chengalvala" in html

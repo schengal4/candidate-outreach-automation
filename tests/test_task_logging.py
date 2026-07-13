@@ -6,7 +6,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import asyncio
 import logging
 
-import app.main as main
+from app.run_manager import manager
 
 records = []
 
@@ -17,7 +17,7 @@ class Capture(logging.Handler):
 
 
 handler = Capture()
-logging.getLogger("app.main").addHandler(handler)
+logging.getLogger("app.run_manager").addHandler(handler)
 
 
 async def scenario():
@@ -27,8 +27,8 @@ async def scenario():
     async def fine():
         return 42
 
-    main._spawn(boom())
-    main._spawn(fine())
+    manager._spawn(boom())
+    manager._spawn(fine())
     await asyncio.sleep(0.05)  # let both settle and callbacks fire
 
 
@@ -39,7 +39,7 @@ try:
     assert "Background task" in errors[0].getMessage()
     assert errors[0].exc_info and "kaboom" in str(errors[0].exc_info[1])
     print("PASS: background-task crash is logged with traceback; successes stay quiet")
-    assert not main._background_tasks, "task set must be drained"
+    assert not manager._tasks, "task set must be drained"
     print("PASS: task registry cleaned up for both outcomes")
 finally:
-    logging.getLogger("app.main").removeHandler(handler)
+    logging.getLogger("app.run_manager").removeHandler(handler)

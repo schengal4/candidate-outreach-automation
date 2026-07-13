@@ -1,4 +1,4 @@
-"""Per-candidate Sent List stored as CSV.
+"""Per-candidate Sent List, backed by SQLite (see app/db.py).
 
 Spec columns: candidate_id, company_domain, contact_name, contact_email,
 date_sent, interview_arranged.
@@ -10,16 +10,19 @@ Two implementation columns are added on top of the spec:
   permanently_excluded — set manually when a contact asks not to be contacted
   again. Blocks outreach forever, overriding the retention window regardless
   of date_sent, and is never pruned.
+
+Every entry has a stable integer `id` (the DB primary key) and all edits
+address entries by that id, scoped to the candidate. The legacy CSV store
+addressed rows by list index, which could hit the wrong row when a running
+pipeline auto-added entries while the user edited the table.
 """
 
-import csv
-import io
 from datetime import date, timedelta
 from typing import Dict, List, Set
 
-from .config import DATA_DIR
-from .fsutil import atomic_write_text
+from . import db
 
+# Columns exposed on the entry dicts (plus "id").
 FIELDNAMES = [
     "candidate_id",
     "company_domain",
@@ -31,40 +34,23 @@ FIELDNAMES = [
     "permanently_excluded",
 ]
 
-_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FIELDS = {"interview_arranged", "confirmed_sent", "permanently_excluded"}
 
 
-def _path(candidate_id: str):
-    return DATA_DIR / f"sent_list_{candidate_id}.csv"
-
-
-def _to_bool(v) -> bool:
-    return str(v).strip().lower() in _TRUE
+def _row_to_entry(row) -> Dict:
+    e = {k: row[k] for k in ("id", *FIELDNAMES)}
+    for k in _BOOL_FIELDS:
+        e[k] = bool(e[k])
+    return e
 
 
 def load_entries(candidate_id: str) -> List[Dict]:
-    p = _path(candidate_id)
-    if not p.exists():
-        return []
-    with open(p, "r", encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-    for r in rows:
-        r["interview_arranged"] = _to_bool(r.get("interview_arranged"))
-        r["confirmed_sent"] = _to_bool(r.get("confirmed_sent"))
-        # missing in CSVs written before the column existed -> False
-        r["permanently_excluded"] = _to_bool(r.get("permanently_excluded"))
-    return rows
-
-
-def save_entries(candidate_id: str, entries: List[Dict]) -> None:
-    # Render to memory, then swap into place atomically — the sent list is
-    # the do-not-recontact record, the last file we can afford to corrupt.
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=FIELDNAMES, lineterminator="\r\n")
-    writer.writeheader()
-    for e in entries:
-        writer.writerow({k: e.get(k, "") for k in FIELDNAMES})
-    atomic_write_text(_path(candidate_id), buf.getvalue())
+    rows = db.query(
+        f"SELECT id, {', '.join(FIELDNAMES)} FROM sent_entries"
+        " WHERE candidate_id = ? ORDER BY id",
+        (candidate_id,),
+    )
+    return [_row_to_entry(r) for r in rows]
 
 
 def add_entry(
@@ -75,24 +61,25 @@ def add_entry(
     date_sent: str = "",
     confirmed_sent: bool = False,
     permanently_excluded: bool = False,
-) -> None:
-    """Append an entry. Defaults fit the auto-add-on-draft-generation path;
-    manual adds (contact reached outside the app) pass confirmed_sent=True and
-    optionally a past date_sent."""
-    entries = load_entries(candidate_id)
-    entries.append(
-        {
-            "candidate_id": candidate_id,
-            "company_domain": company_domain,
-            "contact_name": contact_name,
-            "contact_email": contact_email,
-            "date_sent": date_sent or date.today().isoformat(),
-            "interview_arranged": False,
-            "confirmed_sent": confirmed_sent,
-            "permanently_excluded": permanently_excluded,
-        }
+) -> int:
+    """Append an entry; returns its id. Defaults fit the auto-add-on-draft-
+    generation path; manual adds (contact reached outside the app) pass
+    confirmed_sent=True and optionally a past date_sent."""
+    cur = db.execute(
+        "INSERT INTO sent_entries (candidate_id, company_domain, contact_name,"
+        " contact_email, date_sent, interview_arranged, confirmed_sent,"
+        " permanently_excluded) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        (
+            candidate_id,
+            company_domain,
+            contact_name,
+            contact_email,
+            date_sent or date.today().isoformat(),
+            int(confirmed_sent),
+            int(permanently_excluded),
+        ),
     )
-    save_entries(candidate_id, entries)
+    return cur.lastrowid
 
 
 def _is_active(entry: Dict, retention_months: int) -> bool:
@@ -125,33 +112,49 @@ def pending_confirmation(candidate_id: str) -> List[Dict]:
     return [e for e in load_entries(candidate_id) if not e["confirmed_sent"]]
 
 
-def update_entry(candidate_id: str, index: int, **changes) -> None:
-    entries = load_entries(candidate_id)
-    if 0 <= index < len(entries):
-        entries[index].update(changes)
-        save_entries(candidate_id, entries)
+def update_entry(candidate_id: str, entry_id: int, **changes) -> None:
+    """Update one entry by id. The candidate_id guard means a forged or stale
+    id can never edit another candidate's entry."""
+    fields = [k for k in changes if k in FIELDNAMES and k != "candidate_id"]
+    if not fields:
+        return
+    assignments = ", ".join(f"{k} = ?" for k in fields)
+    values = [
+        int(changes[k]) if k in _BOOL_FIELDS else changes[k] for k in fields
+    ]
+    db.execute(
+        f"UPDATE sent_entries SET {assignments} WHERE id = ? AND candidate_id = ?",
+        (*values, entry_id, candidate_id),
+    )
 
 
-def remove_entry(candidate_id: str, index: int) -> None:
-    entries = load_entries(candidate_id)
-    if 0 <= index < len(entries):
-        entries.pop(index)
-        save_entries(candidate_id, entries)
+def remove_entry(candidate_id: str, entry_id: int) -> None:
+    db.execute(
+        "DELETE FROM sent_entries WHERE id = ? AND candidate_id = ?",
+        (entry_id, candidate_id),
+    )
+
+
+def confirm_all(candidate_id: str) -> None:
+    db.execute(
+        "UPDATE sent_entries SET confirmed_sent = 1 WHERE candidate_id = ?",
+        (candidate_id,),
+    )
 
 
 def delete_list(candidate_id: str) -> None:
     """Remove the candidate's entire sent list — only used when the profile
     itself is deleted (nothing left to run outreach for)."""
-    p = _path(candidate_id)
-    if p.exists():
-        p.unlink()
+    db.execute("DELETE FROM sent_entries WHERE candidate_id = ?", (candidate_id,))
 
 
 def prune_expired(candidate_id: str, retention_months: int) -> int:
     """Remove entries past the retention window. Returns count removed."""
-    entries = load_entries(candidate_id)
-    kept = [e for e in entries if _is_active(e, retention_months)]
-    removed = len(entries) - len(kept)
-    if removed:
-        save_entries(candidate_id, kept)
-    return removed
+    expired = [
+        e["id"]
+        for e in load_entries(candidate_id)
+        if not _is_active(e, retention_months)
+    ]
+    for entry_id in expired:
+        remove_entry(candidate_id, entry_id)
+    return len(expired)

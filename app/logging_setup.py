@@ -16,7 +16,7 @@ Uvicorn's own loggers keep their own handlers and are not touched here.
 import logging
 import logging.handlers
 
-from .config import LOG_DIR, LOG_LEVEL
+from . import config
 
 _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -29,8 +29,9 @@ def configure_logging() -> None:
         return
     _configured = True
 
+    log_level = config.settings.LOG_LEVEL
     # Fall back to INFO on a typo'd LOG_LEVEL instead of crashing startup.
-    level = getattr(logging, LOG_LEVEL, None)
+    level = getattr(logging, log_level, None)
     bad_level = not isinstance(level, int)
 
     formatter = logging.Formatter(_FORMAT)
@@ -38,8 +39,10 @@ def configure_logging() -> None:
     console = logging.StreamHandler()
     console.setFormatter(formatter)
 
+    log_dir = config.settings.LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
     file_handler = logging.handlers.RotatingFileHandler(
-        LOG_DIR / "app.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+        log_dir / "app.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
 
@@ -54,5 +57,5 @@ def configure_logging() -> None:
 
     if bad_level:
         logging.getLogger("app.logging_setup").warning(
-            "Unknown LOG_LEVEL %r — using INFO", LOG_LEVEL
+            "Unknown LOG_LEVEL %r — using INFO", log_level
         )

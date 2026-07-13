@@ -6,7 +6,8 @@ from datetime import date, timedelta
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 import app.pipeline as pipeline
-from app import sent_list
+import app.steps as steps
+from app import run_store, sent_list
 from app.models import Candidate, RunState
 
 CID = "discexcltest"
@@ -30,7 +31,7 @@ async def fake_ask_json(system, user, **kw):
     ]
 
 
-pipeline.ask_json = fake_ask_json
+steps.ask_json = fake_ask_json
 
 try:
     # Sent list: active entry (today), permanently-excluded old entry, expired entry
@@ -69,3 +70,6 @@ try:
     print("PASS: with an empty sent list, discovery behaves exactly as before")
 finally:
     sent_list.delete_list(CID)
+    # run_discovery checkpoints the throwaway runs to the DB — remove them.
+    for rid in ("dr1", "dr2"):
+        run_store.delete_run(rid)

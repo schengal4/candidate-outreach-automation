@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 import app.llm as llm
+from app import config
 
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
           "required": ["ok"], "additionalProperties": False}
@@ -60,13 +61,16 @@ async def test_timeout_raises_llmerror():
         await asyncio.sleep(3600)  # a marathon web-search call
 
     llm._send_request = hanging_send_request
-    llm.LLM_CALL_TIMEOUT_SECONDS = 0.2
+    config.settings.LLM_CALL_TIMEOUT_SECONDS = 0.2
     try:
         await llm.ask_json("SYSTEM", "user", label="contact:SlowCo")
         raise AssertionError("expected LLMError")
-    except llm.LLMError as exc:
-        assert "timed out" in str(exc), exc
-    print("PASS: a hung call raises LLMError instead of running forever")
+    except llm.LLMTimeoutError as exc:
+        # The step label rides in the message — it becomes the company's
+        # drop reason, so the report says WHICH call timed out.
+        assert "timed out" in str(exc) and "contact:SlowCo" in str(exc), exc
+        assert isinstance(exc, llm.LLMError)  # existing catch-sites still work
+    print("PASS: a hung call raises a labeled LLMTimeoutError instead of running forever")
 
 
 asyncio.run(test_schema_sets_output_format())

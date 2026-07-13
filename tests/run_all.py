@@ -21,7 +21,15 @@ TESTS_DIR = Path(__file__).resolve().parent
 TEST_LOG_DIR = tempfile.mkdtemp(prefix="outreach-test-logs-")
 
 # Files that exercise routes without logging in — run with the wall down.
-NEEDS_OPEN_MODE = {"test_batch_save.py", "test_timeout_routes.py"}
+NEEDS_OPEN_MODE = {
+    "test_batch_save.py",
+    "test_timeout_routes.py",
+    "test_bench_backfill.py",
+    "test_claim_revision.py",
+    "test_draft_verification.py",
+    "test_failed_retry_prompt.py",
+    "test_verification_caveat.py",
+}
 
 # Excluded from the default sweep (hit real external services):
 #   - Gmail draft round-trips need a live OAuth token and touch a real inbox.

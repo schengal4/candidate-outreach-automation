@@ -9,11 +9,12 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 import app.auth as auth_mod
-import app.pipeline as pipeline
-from app import storage
-from app.models import Candidate, CompanyState, Contact
+import app.steps as steps
+from app import config, storage
+from app.models import Candidate, Contact
+from app.steps import ResearchResult
 
-main.LOGIN_REQUIRED = True
+config.settings.LOGIN_REQUIRED = True
 OWNER = "venkatachengalvala@gmail.com"
 CID = "516e7c4751"
 INSTR = "Keep it under 100 words. Mention my availability for on-site work. Template: greeting, one observation, one accomplishment, ask."
@@ -56,18 +57,17 @@ try:
         captured["cache_prefix"] = kw.get("cache_prefix", "")
         return {"subject": "s", "body": "b"}
 
-    pipeline.ask_json = fake_ask_json
-    company = CompanyState(name="TestCo", domain="t.com")
-    company.contact_used = Contact(first_name="A", last_name="B", title="VP")
+    steps.ask_json = fake_ask_json
+    contact = Contact(first_name="A", last_name="B", title="VP")
     cand = storage.get_candidate(CID)
-    asyncio.run(pipeline.draft_email(cand, company))
+    asyncio.run(steps.draft_email(cand, contact, "TestCo", ResearchResult()))
     assert "Candidate's own drafting instructions" in captured["cache_prefix"]
     assert INSTR in captured["cache_prefix"]
     assert "Candidate's own drafting instructions" in captured["system"]  # DRAFT_SYSTEM precedence rule
     print("PASS: draft prompt carries the instructions in the cache prefix")
 
     cand.draft_instructions = ""
-    asyncio.run(pipeline.draft_email(cand, company))
+    asyncio.run(steps.draft_email(cand, contact, "TestCo", ResearchResult()))
     assert "drafting instructions" not in captured["cache_prefix"]
     print("PASS: no instructions -> prompt unchanged from before the feature")
 finally:

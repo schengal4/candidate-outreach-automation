@@ -6,9 +6,10 @@ import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 import app.pipeline as pipeline
+from app import config, run_store
 from app.models import Candidate, CompanyState, CompanyStatus, RunPhase, RunState
 
-pipeline.RUN_LAUNCH_JITTER_SECONDS = 0  # tests use sub-second timeouts
+config.settings.RUN_LAUNCH_JITTER_SECONDS = 0  # tests use sub-second timeouts
 
 
 def make_candidate():
@@ -33,7 +34,7 @@ async def slow_company_never(candidate, company, *_a, **_kw):
 
 
 async def test_hard_timeout():
-    pipeline.RUN_HARD_TIMEOUT_SECONDS = 0.3
+    config.settings.RUN_HARD_TIMEOUT_SECONDS = 0.3
     pipeline._run_company = lambda c, comp, *a, **kw: (
         slow_company_ok(c, comp) if comp.name == "FastCo" else slow_company_never(c, comp)
     )
@@ -61,7 +62,7 @@ async def test_hard_timeout():
 
 
 async def test_stop_button():
-    pipeline.RUN_HARD_TIMEOUT_SECONDS = 3600  # long -- stop_event must win the race
+    config.settings.RUN_HARD_TIMEOUT_SECONDS = 3600  # long -- stop_event must win the race
     pipeline._run_company = lambda c, comp, *a, **kw: (
         slow_company_ok(c, comp) if comp.name == "FastCo" else slow_company_never(c, comp)
     )
@@ -90,5 +91,10 @@ async def test_stop_button():
     print(f"PASS: stop button cuts the run short before the hard timeout ({elapsed:.2f}s)")
 
 
-asyncio.run(test_hard_timeout())
-asyncio.run(test_stop_button())
+try:
+    asyncio.run(test_hard_timeout())
+    asyncio.run(test_stop_button())
+finally:
+    # run_pipeline checkpoints the throwaway runs to the DB — remove them.
+    for rid in ("r1", "r2"):
+        run_store.delete_run(rid)

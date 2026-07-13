@@ -9,12 +9,13 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 import app.auth as auth_mod
-from app import sent_list, storage
+from app import config, sent_list, storage
 from app.models import RunState
-from app.pipeline import RUNS
+from app.run_manager import manager
 from app.resume import resume_docx_path, resume_pdf_path
 
-main.LOGIN_REQUIRED = True
+RUNS = manager.runs
+config.settings.LOGIN_REQUIRED = True
 OWNER = "venkatachengalvala@gmail.com"
 TEMP = "temp.tester@example.com"
 
@@ -122,7 +123,7 @@ finally:
     RUNS.pop("temprun1", None)
 
 # 7. Open mode unchanged: table + create form for everyone
-main.LOGIN_REQUIRED = False
+config.settings.LOGIN_REQUIRED = False
 open_client = TestClient(main.app)
 r = open_client.get("/", follow_redirects=False)
 assert r.status_code == 200

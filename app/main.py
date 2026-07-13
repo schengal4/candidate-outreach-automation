@@ -3,152 +3,110 @@
 Run with:  python -m uvicorn app.main:app --reload
 Requires:  ANTHROPIC_API_KEY and HUNTER_API_KEY in the environment.
 
-Pipeline logic lives in app/pipeline.py and is UI-agnostic, so this layer can
-be swapped for React/Next.js later.
+Structure: create_app() is the factory; the module-level `app` at the bottom
+keeps the uvicorn command above working. Importing this module has no heavy
+side effects — logging setup, the startup backup, the legacy-data migration,
+and reloading persisted runs all happen in the lifespan handler, which runs
+when the server (or a TestClient used as a context manager) starts.
+
+Pipeline logic lives in app/pipeline.py + app/steps.py and is UI-agnostic;
+run lifecycle (spawning, stopping, the daily cap) is owned by the RunManager
+(app/run_manager.py); per-account ownership checks are FastAPI dependencies
+(app/deps.py), so this layer is just routes.
 """
 
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-# Configure once for the whole app (uvicorn's own loggers are separate) —
-# console + rotating file under data/logs/; see app/logging_setup.py.
-from .logging_setup import configure_logging
-
-configure_logging()
-logger = logging.getLogger("app.main")
-
-from fastapi import FastAPI, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, backup, gmail_client, run_store, sent_list, storage
+from . import auth, backup, config, db, gmail_client, sent_list, storage
 from .auth import LoginError
-from .config import (
-    DEFAULT_MAX_COMPANIES,
-    DEFAULT_RETENTION_MONTHS,
-    LOGIN_REQUIRED,
-    MAX_COMPANIES_HARD_CAP,
-    MAX_RUNS_PER_DAY,
-    RETENTION_MAX,
-    RETENTION_MIN,
-    SESSION_MAX_AGE_SECONDS,
-    SESSION_SECRET,
-    TIMEOUT_BUTTON_AFTER_SECONDS,
-)
+from .deps import NotFoundError, owned_candidate, owned_run, session_owner
 from .fsutil import atomic_write_bytes
 from .gmail_client import GmailNotConfigured
-from .models import Candidate, CompanyStatus, RunPhase, RunState
-from .pipeline import RUNS, run_discovery, run_pipeline
+from .logging_setup import configure_logging
+from .models import Candidate, CompanyStatus, RunPhase
 from .resume import ensure_resume_pdf, extract_docx_text, resume_docx_path, resume_pdf_path
+from .run_manager import manager
 
-app = FastAPI(title="Candidate Outreach Automation")
+logger = logging.getLogger("app.main")
+
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+router = APIRouter()
 
-# Daily-ish safety copy of data/ (candidates, sent lists, runs, tokens).
-# Never raises — see app/backup.py.
-backup.backup_data_dir()
-
-# ------------------------------------------------------------------ #
-# Login wall (Google Sign-In — see app/auth.py). The guard is defined
-# BEFORE SessionMiddleware is added: Starlette runs the last-added
-# middleware outermost, so adding SessionMiddleware second guarantees
-# request.session exists by the time the guard runs.
-# ------------------------------------------------------------------ #
 _PUBLIC_PATHS = {"/login", "/auth/login", "/auth/callback", "/favicon.ico"}
 
 
-@app.middleware("http")
-async def require_login(request: Request, call_next):
-    if (
-        LOGIN_REQUIRED
-        and request.url.path not in _PUBLIC_PATHS
-        and not request.session.get("user_email")
-    ):
-        return RedirectResponse("/login", status_code=303)
-    return await call_next(request)
+def _not_found_response(exc: NotFoundError) -> HTMLResponse:
+    return HTMLResponse(
+        f"<p>{exc.message} <a href='/'>Back</a></p>", status_code=404
+    )
 
 
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    max_age=SESSION_MAX_AGE_SECONDS,
-    same_site="lax",
-)
-
-# Keep references to background tasks so they aren't garbage collected mid-run.
-_background_tasks: set = set()
-
-
-def _on_task_done(task: asyncio.Task) -> None:
-    _background_tasks.discard(task)
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc:
-        # Pipeline code catches its own errors into run state; anything that
-        # reaches here would otherwise disappear without a trace.
-        logger.error("Background task %s failed", task.get_name(), exc_info=exc)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config.ensure_dirs()
+    # Configure once for the whole app (uvicorn's own loggers are separate) —
+    # console + rotating file under data/logs/; see app/logging_setup.py.
+    configure_logging()
+    # Daily-ish safety copy of data/ (candidates, sent lists, runs, tokens).
+    # Runs BEFORE the first DB connect so the pre-migration legacy files are
+    # zipped away too. Never raises — see app/backup.py.
+    backup.backup_data_dir()
+    db.connect()  # creates the schema; imports legacy files on first run
+    # Seed the run registry from disk so a restart doesn't lose finished
+    # reports or a run parked at the review gate.
+    manager.load_persisted()
+    yield
 
 
-def _spawn(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_on_task_done)
+def create_app() -> FastAPI:
+    app = FastAPI(title="Candidate Outreach Automation", lifespan=lifespan)
 
+    # Login wall (Google Sign-In — see app/auth.py). The guard is registered
+    # BEFORE SessionMiddleware is added: Starlette runs the last-added
+    # middleware outermost, so adding SessionMiddleware second guarantees
+    # request.session exists by the time the guard runs.
+    @app.middleware("http")
+    async def require_login(request: Request, call_next):
+        if (
+            config.settings.LOGIN_REQUIRED
+            and request.url.path not in _PUBLIC_PATHS
+            and not request.session.get("user_email")
+        ):
+            return RedirectResponse("/login", status_code=303)
+        return await call_next(request)
 
-def _candidate_not_found() -> HTMLResponse:
-    return HTMLResponse("<p>Candidate not found. <a href='/'>Back</a></p>", status_code=404)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=config.session_secret(),
+        max_age=config.settings.SESSION_MAX_AGE_SECONDS,
+        same_site="lax",
+    )
 
+    @app.exception_handler(NotFoundError)
+    async def not_found_handler(request: Request, exc: NotFoundError):
+        return _not_found_response(exc)
 
-# ------------------------------------------------------------------ #
-# Per-account data isolation. Every candidate belongs to the Google
-# account that created it; all lookups below scope to the logged-in user.
-# ------------------------------------------------------------------ #
-def _session_owner(request: Request) -> Optional[str]:
-    """The login email data is scoped to — None in open mode (REQUIRE_LOGIN=0),
-    where the app intentionally behaves like the original single-user version."""
-    if not LOGIN_REQUIRED:
-        return None
-    return str(request.session.get("user_email", "")).strip().lower()
-
-
-def _owned_candidate(request: Request, candidate_id: str) -> Optional[Candidate]:
-    """The candidate, but only if the logged-in user owns it.
-
-    A candidate owned by someone else returns None — indistinguishable from
-    not-found, so candidate IDs can't be probed for existence."""
-    candidate = storage.get_candidate(candidate_id)
-    if not candidate:
-        return None
-    owner = _session_owner(request)
-    if owner is not None and candidate.owner_email.strip().lower() != owner:
-        return None
-    return candidate
-
-
-def _owned_run(request: Request, run_id: str) -> Tuple[Optional[RunState], Optional[Candidate]]:
-    """(run, candidate) for a run the logged-in user owns, else (None, None).
-    Runs have no owner of their own — they inherit the candidate's."""
-    run = RUNS.get(run_id)
-    if not run:
-        return None, None
-    candidate = _owned_candidate(request, run.candidate_id)
-    if not candidate:
-        return None, None
-    return run, candidate
+    app.include_router(router)
+    return app
 
 
 # ------------------------------------------------------------------ #
 # Home / candidates
 # ------------------------------------------------------------------ #
-@app.get("/", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    owner = _session_owner(request)
+    owner = session_owner(request)
     candidates = storage.list_candidates(owner_email=owner)
     # One account is one job-seeker profile: with exactly one candidate, the
     # home page IS that profile. Zero shows the setup form; two or more (a
@@ -163,17 +121,17 @@ async def index(request: Request):
             "candidates": candidates,
             "single_profile_mode": owner is not None,
             "defaults": {
-                "max_companies": DEFAULT_MAX_COMPANIES,
-                "hard_cap": MAX_COMPANIES_HARD_CAP,
-                "retention": DEFAULT_RETENTION_MONTHS,
-                "retention_min": RETENTION_MIN,
-                "retention_max": RETENTION_MAX,
+                "max_companies": config.settings.DEFAULT_MAX_COMPANIES,
+                "hard_cap": config.settings.MAX_COMPANIES_HARD_CAP,
+                "retention": config.settings.DEFAULT_RETENTION_MONTHS,
+                "retention_min": config.settings.RETENTION_MIN,
+                "retention_max": config.settings.RETENTION_MAX,
             },
         },
     )
 
 
-@app.post("/candidates")
+@router.post("/candidates")
 async def create_candidate(
     request: Request,
     resume: UploadFile,
@@ -186,12 +144,12 @@ async def create_candidate(
     target_industry_role: str = Form(""),
     draft_instructions: str = Form(""),
     red_flag_detection: bool = Form(False),
-    retention_months: int = Form(DEFAULT_RETENTION_MONTHS),
-    max_companies: int = Form(DEFAULT_MAX_COMPANIES),
+    retention_months: Optional[int] = Form(None),
+    max_companies: Optional[int] = Form(None),
 ):
     # One profile per account (when login is on): a second create just lands
     # on the existing profile instead of quietly making a duplicate.
-    owner = _session_owner(request)
+    owner = session_owner(request)
     if owner is not None:
         existing = storage.list_candidates(owner_email=owner)
         if existing:
@@ -207,11 +165,16 @@ async def create_candidate(
             status_code=400,
         )
 
+    s = config.settings
+    if retention_months is None:
+        retention_months = s.DEFAULT_RETENTION_MONTHS
+    if max_companies is None:
+        max_companies = s.DEFAULT_MAX_COMPANIES
     candidate = Candidate(
         id=Candidate.new_id(),
         name=name.strip(),
         email=email.strip(),
-        owner_email=_session_owner(request) or "",
+        owner_email=owner or "",
         current_employer=current_employer.strip(),
         resume_text=resume_text,
         resume_filename=resume.filename or "resume.docx",
@@ -221,8 +184,8 @@ async def create_candidate(
         target_industry_role=target_industry_role.strip(),
         draft_instructions=draft_instructions.strip(),
         red_flag_detection=bool(red_flag_detection),
-        retention_months=max(RETENTION_MIN, min(RETENTION_MAX, retention_months)),
-        max_companies=max(1, min(MAX_COMPANIES_HARD_CAP, max_companies)),
+        retention_months=max(s.RETENTION_MIN, min(s.RETENTION_MAX, retention_months)),
+        max_companies=max(1, min(s.MAX_COMPANIES_HARD_CAP, max_companies)),
     )
     atomic_write_bytes(resume_docx_path(candidate), data)
     storage.save_candidate(candidate)
@@ -240,11 +203,8 @@ async def create_candidate(
     return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
-@app.get("/candidates/{candidate_id}", response_class=HTMLResponse)
-async def candidate_page(request: Request, candidate_id: str):
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
+@router.get("/candidates/{candidate_id}", response_class=HTMLResponse)
+async def candidate_page(request: Request, candidate: Candidate = Depends(owned_candidate)):
     past_runs = [
         {
             "id": r.id,
@@ -253,80 +213,102 @@ async def candidate_page(request: Request, candidate_id: str):
             "drafts": sum(1 for co in r.companies if co.status == CompanyStatus.DONE),
             "companies": len(r.companies) or len(r.discovered),
         }
-        for r in sorted(
-            (r for r in RUNS.values() if r.candidate_id == candidate_id),
-            key=lambda r: r.created_at,
-            reverse=True,
-        )
+        for r in manager.for_candidate(candidate.id)
     ]
     return templates.TemplateResponse(
         request,
         "candidate.html",
         {
             "c": candidate,
-            "pending": sent_list.pending_confirmation(candidate_id),
-            "gmail_connected": gmail_client.is_connected(candidate_id),
+            "pending": sent_list.pending_confirmation(candidate.id),
+            "gmail_connected": gmail_client.is_connected(candidate.id),
             "past_runs": past_runs,
         },
     )
 
 
-@app.post("/candidates/{candidate_id}/delete")
-async def delete_candidate(request: Request, candidate_id: str):
+@router.post("/candidates/{candidate_id}/delete")
+async def delete_candidate(candidate: Candidate = Depends(owned_candidate)):
     """Remove a profile and everything belonging to it: the record, resume
     files, the Gmail grant (revoked at Google), the sent list, and any
     in-memory runs. Irreversible — the UI confirms before posting here."""
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
-    logger.info("Deleting candidate %s and all associated data", candidate_id)
+    logger.info("Deleting candidate %s and all associated data", candidate.id)
     # Best-effort revoke + token file removal; blocking network call to
     # Google (up to its 10s timeout) — keep it off the event loop.
-    await asyncio.to_thread(gmail_client.disconnect, candidate_id)
+    await asyncio.to_thread(gmail_client.disconnect, candidate.id)
     for path in (resume_docx_path(candidate), resume_pdf_path(candidate)):
         if path.exists():
             path.unlink()
-    sent_list.delete_list(candidate_id)
-    run_store.delete_candidate_runs(candidate_id, RUNS)
-    storage.delete_candidate(candidate_id)
+    sent_list.delete_list(candidate.id)
+    manager.delete_candidate_runs(candidate.id)
+    storage.delete_candidate(candidate.id)
     return RedirectResponse("/", status_code=303)
 
 
-@app.post("/candidates/{candidate_id}/draft_instructions")
+@router.post("/candidates/{candidate_id}/draft_instructions")
 async def update_draft_instructions(
-    request: Request, candidate_id: str, draft_instructions: str = Form("")
+    candidate: Candidate = Depends(owned_candidate), draft_instructions: str = Form("")
 ):
     """Edit the per-candidate email drafting instructions/template any time —
-    the only candidate field editable after creation, since it's the one users
-    iterate on between runs as they see real drafts."""
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
+    it's the field users iterate on between runs as they see real drafts."""
     candidate.draft_instructions = draft_instructions.strip()
     storage.save_candidate(candidate)
-    return RedirectResponse(f"/candidates/{candidate_id}", status_code=303)
+    return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
+
+
+@router.post("/candidates/{candidate_id}/resume")
+async def replace_resume(resume: UploadFile, candidate: Candidate = Depends(owned_candidate)):
+    """Replace the candidate's resume with a newly uploaded .docx. Takes effect
+    from the next run onward; drafts in existing runs keep the old text."""
+    data = await resume.read()
+    try:
+        resume_text = extract_docx_text(data)
+    except Exception:
+        return HTMLResponse(
+            "<p>Could not read that resume. Please upload a .docx file. "
+            f"<a href='/candidates/{candidate.id}'>Back</a></p>",
+            status_code=400,
+        )
+    # Remove the old files first — their paths depend on the old filename.
+    for path in (resume_docx_path(candidate), resume_pdf_path(candidate)):
+        if path.exists():
+            path.unlink()
+    candidate.resume_text = resume_text
+    candidate.resume_filename = resume.filename or "resume.docx"
+    atomic_write_bytes(resume_docx_path(candidate), data)
+    storage.save_candidate(candidate)
+    logger.info("Replaced resume for candidate %s (%s)", candidate.id, candidate.resume_filename)
+    # Same best-effort PDF pre-conversion as at profile creation.
+    try:
+        await asyncio.to_thread(ensure_resume_pdf, candidate)
+    except Exception:
+        logger.warning(
+            "Resume PDF pre-conversion failed for candidate %s (draft creation will retry)",
+            candidate.id, exc_info=True,
+        )
+    return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
 # ------------------------------------------------------------------ #
 # App login (Google Sign-In — identity only; see app/auth.py)
 # ------------------------------------------------------------------ #
-@app.get("/login", response_class=HTMLResponse)
+@router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    if not LOGIN_REQUIRED or request.session.get("user_email"):
+    if not config.settings.LOGIN_REQUIRED or request.session.get("user_email"):
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(
         request, "login.html", {"error": request.session.pop("login_error", "")}
     )
 
 
-@app.get("/auth/login")
+@router.get("/auth/login")
 async def auth_login(request: Request):
-    if not LOGIN_REQUIRED:
+    if not config.settings.LOGIN_REQUIRED:
         return RedirectResponse("/", status_code=303)
     return RedirectResponse(auth.build_login_url())
 
 
-@app.get("/auth/callback")
+@router.get("/auth/callback")
 async def auth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if error or not code or not state:
         request.session["login_error"] = f"Sign-in was not completed ({error or 'no code returned'})."
@@ -346,7 +328,7 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
     return RedirectResponse("/", status_code=303)
 
 
-@app.post("/logout")
+@router.post("/logout")
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
@@ -355,88 +337,65 @@ async def logout(request: Request):
 # ------------------------------------------------------------------ #
 # Gmail (drafts only — see app/gmail_client.py for the compliance notes)
 # ------------------------------------------------------------------ #
-@app.get("/candidates/{candidate_id}/gmail/connect", response_class=HTMLResponse)
-async def gmail_connect_explainer(request: Request, candidate_id: str):
+@router.get("/candidates/{candidate_id}/gmail/connect", response_class=HTMLResponse)
+async def gmail_connect_explainer(
+    request: Request, candidate: Candidate = Depends(owned_candidate)
+):
     """Our own consent step, shown before handing off to Google's own screen."""
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
     return templates.TemplateResponse(request, "gmail_connect.html", {"c": candidate})
 
 
-@app.get("/candidates/{candidate_id}/gmail/authorize")
-async def gmail_authorize(request: Request, candidate_id: str):
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
+@router.get("/candidates/{candidate_id}/gmail/authorize")
+async def gmail_authorize(candidate: Candidate = Depends(owned_candidate)):
     try:
-        return RedirectResponse(gmail_client.build_auth_url(candidate_id))
+        return RedirectResponse(gmail_client.build_auth_url(candidate.id))
     except GmailNotConfigured as exc:
         return HTMLResponse(f"<p>{exc}</p>", status_code=500)
 
 
-@app.get("/gmail/callback", response_class=HTMLResponse)
+@router.get("/gmail/callback", response_class=HTMLResponse)
 async def gmail_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if error or not code or not state:
         return HTMLResponse(f"<p>Gmail connection was not completed ({error or 'no code returned'}).</p>")
     # `state` is the candidate_id — only store the token if the logged-in
     # user owns that candidate (blocks token-planting via a forged callback).
-    if not _owned_candidate(request, state):
-        return _candidate_not_found()
+    # Raises NotFoundError (-> 404 page) otherwise.
+    owned_candidate(request, state)
     # Blocking token exchange with Google — keep it off the event loop.
     await asyncio.to_thread(gmail_client.handle_oauth_callback, code, candidate_id=state)
     return RedirectResponse(f"/candidates/{state}", status_code=303)
 
 
-@app.post("/candidates/{candidate_id}/gmail/disconnect")
-async def gmail_disconnect(request: Request, candidate_id: str):
-    if not _owned_candidate(request, candidate_id):
-        return _candidate_not_found()
+@router.post("/candidates/{candidate_id}/gmail/disconnect")
+async def gmail_disconnect(candidate: Candidate = Depends(owned_candidate)):
     # Blocking revoke call to Google (up to its 10s timeout) — off the loop.
-    await asyncio.to_thread(gmail_client.disconnect, candidate_id)
-    return RedirectResponse(f"/candidates/{candidate_id}", status_code=303)
+    await asyncio.to_thread(gmail_client.disconnect, candidate.id)
+    return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
 # ------------------------------------------------------------------ #
 # Runs
 # ------------------------------------------------------------------ #
-@app.post("/candidates/{candidate_id}/runs")
-async def start_run(request: Request, candidate_id: str):
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
-    # Cost guardrail: every run spends real money on the app owner's API
-    # keys, so cap runs per profile per rolling 24h. Counted from persisted
-    # runs (run_store keeps at least MAX_RUNS_PER_DAY per candidate).
-    runs_today = sum(
-        1 for r in RUNS.values()
-        if r.candidate_id == candidate_id and (time.time() - r.created_at) < 24 * 3600
-    )
-    if runs_today >= MAX_RUNS_PER_DAY:
+@router.post("/candidates/{candidate_id}/runs")
+async def start_run(candidate: Candidate = Depends(owned_candidate)):
+    if manager.daily_cap_reached(candidate.id):
+        cap = config.settings.MAX_RUNS_PER_DAY
         logger.warning(
-            "Run refused for candidate %s: daily cap reached (%d/24h)",
-            candidate_id, MAX_RUNS_PER_DAY,
+            "Run refused for candidate %s: daily cap reached (%d/24h)", candidate.id, cap
         )
         return HTMLResponse(
-            f"<p>Daily run limit reached ({MAX_RUNS_PER_DAY} per profile per 24 hours) — "
+            f"<p>Daily run limit reached ({cap} per profile per 24 hours) — "
             f"each run costs real API money, so this is capped. Try again later. "
-            f"<a href='/candidates/{candidate_id}'>Back</a></p>",
+            f"<a href='/candidates/{candidate.id}'>Back</a></p>",
             status_code=429,
         )
-    run = RunState(id=RunState.new_id(), candidate_id=candidate_id)
-    RUNS[run.id] = run
-    run_store.save_run(run)
-    # Starting a new run is when old ones age out (keep the most recent few).
-    run_store.prune_candidate_runs(candidate_id, RUNS)
-    _spawn(run_discovery(run, candidate))
+    run = manager.start_run(candidate)
     return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
 
-@app.get("/runs/{run_id}", response_class=HTMLResponse)
-async def run_page(request: Request, run_id: str):
-    run, candidate = _owned_run(request, run_id)
-    if not run:
-        return HTMLResponse("<p>Run not found. <a href='/'>Back</a></p>", status_code=404)
+@router.get("/runs/{run_id}", response_class=HTMLResponse)
+async def run_page(request: Request, owned=Depends(owned_run)):
+    run, candidate = owned
     # True elapsed time of the run itself (the old counter measured time since
     # the page loaded). Frozen once the run is finished; ticks while it works.
     start = run.started_running_at or run.created_at
@@ -453,15 +412,18 @@ async def run_page(request: Request, run_id: str):
     )
 
 
-@app.get("/runs/{run_id}/panel", response_class=HTMLResponse)
+@router.get("/runs/{run_id}/panel", response_class=HTMLResponse)
 async def run_panel(request: Request, run_id: str):
-    run, candidate = _owned_run(request, run_id)
-    if not run:
+    # No Depends here: a missing/unowned run answers HTTP 286 (not 404) so
+    # HTMX stops polling a dead panel instead of retrying forever.
+    try:
+        run, candidate = owned_run(request, run_id)
+    except NotFoundError:
         return HTMLResponse("<p>Run not found.</p>", status_code=286)
     show_timeout_button = (
         run.phase == RunPhase.RUNNING
         and run.started_running_at is not None
-        and (time.time() - run.started_running_at) >= TIMEOUT_BUTTON_AFTER_SECONDS
+        and (time.time() - run.started_running_at) >= config.settings.TIMEOUT_BUTTON_AFTER_SECONDS
     )
     response = templates.TemplateResponse(
         request,
@@ -471,6 +433,7 @@ async def run_panel(request: Request, run_id: str):
             "c": candidate,
             "gmail_connected": candidate and gmail_client.is_connected(candidate.id),
             "show_timeout_button": show_timeout_button,
+            "hard_timeout_minutes": config.settings.RUN_HARD_TIMEOUT_SECONDS // 60,
         },
     )
     # HTTP 286 tells HTMX to stop polling once we've reached a stable phase.
@@ -479,96 +442,90 @@ async def run_panel(request: Request, run_id: str):
     return response
 
 
-@app.post("/runs/{run_id}/stop_early")
-async def stop_run_early(request: Request, run_id: str):
+@router.post("/runs/{run_id}/stop_early")
+async def stop_run_early(owned=Depends(owned_run)):
     """Triggered by the "retrieve what's done" button — cuts a running
     pipeline short at the next check, keeping whatever already finished."""
-    run, _ = _owned_run(request, run_id)
-    if run and run.phase == RunPhase.RUNNING:
-        logger.info("Run %s: stop-early requested", run_id)
-        run.stop_event.set()
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+    run, _ = owned
+    manager.stop_early(run)
+    return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
 
-@app.post("/runs/{run_id}/companies/{index}/save_to_gmail")
-async def save_to_gmail(request: Request, run_id: str, index: int):
-    run, candidate = _owned_run(request, run_id)
-    if not run or not (0 <= index < len(run.companies)):
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
+@router.post("/runs/{run_id}/companies/{index}/save_to_gmail")
+async def save_to_gmail(index: int, owned=Depends(owned_run)):
+    run, candidate = owned
+    if not (0 <= index < len(run.companies)):
+        return RedirectResponse(f"/runs/{run.id}", status_code=303)
     company = run.companies[index]
-    if candidate and company.draft_subject:
+    # Require an email: manual-outreach drafts (verified contact, no Hunter
+    # email) have no recipient, and the UI shows no button for them — but guard
+    # the route too so a stale form or double-submit can't create an empty draft.
+    if company.draft_subject and company.email:
         try:
             await gmail_client.create_draft(candidate, company)
             company.gmail_draft_created = True
             company.gmail_error = ""
         except Exception as exc:
             logger.warning(
-                "Run %s: Gmail draft failed for %s: %s", run_id, company.name, exc
+                "Run %s: Gmail draft failed for %s: %s", run.id, company.name, exc
             )
             company.gmail_error = str(exc)
-        run_store.save_run(run)  # the saved-to-Gmail marks survive restarts too
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+        manager.save(run)  # the saved-to-Gmail marks survive restarts too
+    return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
 
-@app.post("/runs/{run_id}/save_all_to_gmail")
-async def save_all_to_gmail(request: Request, run_id: str):
+@router.post("/runs/{run_id}/save_all_to_gmail")
+async def save_all_to_gmail(owned=Depends(owned_run)):
     """Batch version of save_to_gmail — one explicit click after all drafts in
     the run are visible on screen. Per-draft failures don't stop the rest."""
-    run, candidate = _owned_run(request, run_id)
-    if not run:
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
-    if candidate:
-        for company in run.companies:
-            if company.draft_subject and not company.gmail_draft_created:
-                try:
-                    await gmail_client.create_draft(candidate, company)
-                    company.gmail_draft_created = True
-                    company.gmail_error = ""
-                except Exception as exc:
-                    logger.warning(
-                        "Run %s: Gmail draft failed for %s: %s", run_id, company.name, exc
-                    )
-                    company.gmail_error = str(exc)
-        run_store.save_run(run)  # the saved-to-Gmail marks survive restarts too
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+    run, candidate = owned
+    for company in run.companies:
+        # Skip manual-outreach drafts with no email (see save_to_gmail).
+        if company.draft_subject and company.email and not company.gmail_draft_created:
+            try:
+                await gmail_client.create_draft(candidate, company)
+                company.gmail_draft_created = True
+                company.gmail_error = ""
+            except Exception as exc:
+                logger.warning(
+                    "Run %s: Gmail draft failed for %s: %s", run.id, company.name, exc
+                )
+                company.gmail_error = str(exc)
+    manager.save(run)  # the saved-to-Gmail marks survive restarts too
+    return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
 
-@app.post("/runs/{run_id}/approve")
-async def approve_companies(request: Request, run_id: str):
-    run, candidate = _owned_run(request, run_id)
-    if not run or run.phase != RunPhase.REVIEW:
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
+@router.post("/runs/{run_id}/approve")
+async def approve_companies(request: Request, owned=Depends(owned_run)):
+    run, candidate = owned
+    if run.phase != RunPhase.REVIEW:
+        return RedirectResponse(f"/runs/{run.id}", status_code=303)
     form = await request.form()
     approved = form.getlist("approved")
     if not approved:
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
-    _spawn(run_pipeline(run, candidate, [str(d) for d in approved]))
-    run.phase = RunPhase.RUNNING  # flip immediately so the page starts polling
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+        return RedirectResponse(f"/runs/{run.id}", status_code=303)
+    manager.approve(run, candidate, [str(d) for d in approved])
+    return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
 
 # ------------------------------------------------------------------ #
 # Sent list
 # ------------------------------------------------------------------ #
-@app.get("/sent/{candidate_id}", response_class=HTMLResponse)
-async def sent_page(request: Request, candidate_id: str):
-    candidate = _owned_candidate(request, candidate_id)
-    if not candidate:
-        return _candidate_not_found()
+@router.get("/sent/{candidate_id}", response_class=HTMLResponse)
+async def sent_page(request: Request, candidate: Candidate = Depends(owned_candidate)):
     return templates.TemplateResponse(
         request,
         "sent_list.html",
         {
             "c": candidate,
-            "entries": sent_list.load_entries(candidate_id),
+            "entries": sent_list.load_entries(candidate.id),
         },
     )
 
 
-@app.post("/sent/{candidate_id}/add")
+@router.post("/sent/{candidate_id}/add")
 async def sent_add(
-    request: Request,
-    candidate_id: str,
+    candidate: Candidate = Depends(owned_candidate),
     contact_email: str = Form(...),
     company_domain: str = Form(""),
     contact_name: str = Form(""),
@@ -577,9 +534,9 @@ async def sent_add(
 ):
     """Manual entry for a contact reached outside the app (LinkedIn, in person,
     another tool) so future runs treat them as recently contacted."""
-    if _owned_candidate(request, candidate_id) and contact_email.strip():
+    if contact_email.strip():
         sent_list.add_entry(
-            candidate_id,
+            candidate.id,
             company_domain.strip(),
             contact_name.strip(),
             contact_email.strip(),
@@ -587,38 +544,36 @@ async def sent_add(
             confirmed_sent=True,  # already sent — no reconciliation nudge needed
             permanently_excluded=bool(permanently_excluded),
         )
-    return RedirectResponse(f"/sent/{candidate_id}", status_code=303)
+    return RedirectResponse(f"/sent/{candidate.id}", status_code=303)
 
 
-@app.post("/sent/{candidate_id}/{index}/update")
+@router.post("/sent/{candidate_id}/{entry_id}/update")
 async def sent_update(
-    request: Request,
-    candidate_id: str,
-    index: int,
+    entry_id: int,
+    candidate: Candidate = Depends(owned_candidate),
     contact_email: str = Form(None),
     date_sent: str = Form(None),
     action: str = Form(...),
 ):
-    if not _owned_candidate(request, candidate_id):
-        return _candidate_not_found()
+    # Entries are addressed by their stable DB id (never by table position —
+    # a running pipeline may be appending entries concurrently with an edit).
+    cid = candidate.id
     if action == "delete":
-        sent_list.remove_entry(candidate_id, index)
+        sent_list.remove_entry(cid, entry_id)
     elif action == "toggle_interview":
-        entries = sent_list.load_entries(candidate_id)
-        if 0 <= index < len(entries):
+        entry = next((e for e in sent_list.load_entries(cid) if e["id"] == entry_id), None)
+        if entry:
             sent_list.update_entry(
-                candidate_id, index,
-                interview_arranged=not entries[index]["interview_arranged"],
+                cid, entry_id, interview_arranged=not entry["interview_arranged"]
             )
     elif action == "toggle_permanent":
-        entries = sent_list.load_entries(candidate_id)
-        if 0 <= index < len(entries):
+        entry = next((e for e in sent_list.load_entries(cid) if e["id"] == entry_id), None)
+        if entry:
             sent_list.update_entry(
-                candidate_id, index,
-                permanently_excluded=not entries[index]["permanently_excluded"],
+                cid, entry_id, permanently_excluded=not entry["permanently_excluded"]
             )
     elif action == "confirm_sent":
-        sent_list.update_entry(candidate_id, index, confirmed_sent=True)
+        sent_list.update_entry(cid, entry_id, confirmed_sent=True)
     elif action == "save":
         changes = {}
         if contact_email is not None:
@@ -626,24 +581,20 @@ async def sent_update(
         if date_sent:
             changes["date_sent"] = date_sent.strip()
         if changes:
-            sent_list.update_entry(candidate_id, index, **changes)
-    return RedirectResponse(f"/sent/{candidate_id}", status_code=303)
+            sent_list.update_entry(cid, entry_id, **changes)
+    return RedirectResponse(f"/sent/{cid}", status_code=303)
 
 
-@app.post("/sent/{candidate_id}/confirm_all")
-async def sent_confirm_all(request: Request, candidate_id: str):
-    if not _owned_candidate(request, candidate_id):
-        return _candidate_not_found()
-    entries = sent_list.load_entries(candidate_id)
-    for e in entries:
-        e["confirmed_sent"] = True
-    sent_list.save_entries(candidate_id, entries)
-    return RedirectResponse(f"/candidates/{candidate_id}", status_code=303)
+@router.post("/sent/{candidate_id}/confirm_all")
+async def sent_confirm_all(candidate: Candidate = Depends(owned_candidate)):
+    sent_list.confirm_all(candidate.id)
+    return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
-@app.post("/sent/{candidate_id}/prune")
-async def sent_prune(request: Request, candidate_id: str):
-    candidate = _owned_candidate(request, candidate_id)
-    if candidate:
-        sent_list.prune_expired(candidate_id, candidate.retention_months)
-    return RedirectResponse(f"/sent/{candidate_id}", status_code=303)
+@router.post("/sent/{candidate_id}/prune")
+async def sent_prune(candidate: Candidate = Depends(owned_candidate)):
+    sent_list.prune_expired(candidate.id, candidate.retention_months)
+    return RedirectResponse(f"/sent/{candidate.id}", status_code=303)
+
+
+app = create_app()

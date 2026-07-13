@@ -5,7 +5,7 @@ email as a single paragraph)."""
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
-from app.pipeline import _break_up_wall_of_text
+from app.draft_hygiene import break_up_wall_of_text as _break_up_wall_of_text
 
 # Condensed from the real single-paragraph draft (Cohere Health run): five
 # sentences, no paragraph breaks at all.

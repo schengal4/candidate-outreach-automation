@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hunter_client import HunterAPIError, HunterClient  # noqa: E402
 
-from .config import HUNTER_CONCURRENCY, MIN_EMAIL_SCORE  # noqa: E402
+from . import config  # noqa: E402
 
 logger = logging.getLogger("app.hunter")
 
@@ -26,7 +26,7 @@ _client: Optional[HunterClient] = None
 def _get_semaphore() -> asyncio.Semaphore:
     global _semaphore
     if _semaphore is None:
-        _semaphore = asyncio.Semaphore(HUNTER_CONCURRENCY)
+        _semaphore = asyncio.Semaphore(config.settings.HUNTER_CONCURRENCY)
     return _semaphore
 
 
@@ -37,8 +37,13 @@ def _get_client() -> HunterClient:
     return _client
 
 
-async def find_email(domain: str, first_name: str, last_name: str) -> Tuple[Optional[str], Optional[int]]:
-    """Return (email, score) if Hunter finds a confident match, else (None, None)."""
+async def find_email(domain: str, first_name: str, last_name: str) -> Tuple[Optional[str], Optional[int], str]:
+    """Return (email, score, linkedin_url) if Hunter finds a confident match,
+    else (None, None, "").
+
+    linkedin_url is Hunter's own field for the person, sourced from pages it
+    observed — free corroboration for the LLM-identified contact's profile
+    link, which the model has been known to guess."""
     async with _get_semaphore():
         try:
             result = await asyncio.to_thread(
@@ -49,16 +54,20 @@ async def find_email(domain: str, first_name: str, last_name: str) -> Tuple[Opti
             )
         except HunterAPIError as exc:
             logger.warning("Hunter lookup failed for %s %s @ %s: %s", first_name, last_name, domain, exc)
-            return None, None
+            return None, None, ""
     data = (result or {}).get("data") or {}
     email = data.get("email")
     score = data.get("score")
-    if email and (score is None or score >= MIN_EMAIL_SCORE):
+    linkedin_url = str(data.get("linkedin_url") or "").strip()
+    if email and (score is None or score >= config.settings.MIN_EMAIL_SCORE):
         # The address itself stays out of the logs (it's in the run report).
-        logger.info("Hunter: email found @ %s (score=%s)", domain, score)
-        return email, score
+        logger.info(
+            "Hunter: email found @ %s (score=%s, linkedin=%s)",
+            domain, score, "yes" if linkedin_url else "no",
+        )
+        return email, score, linkedin_url
     logger.info(
         "Hunter: no confident email for %s %s @ %s (score=%s)",
         first_name, last_name, domain, score,
     )
-    return None, None
+    return None, None, ""

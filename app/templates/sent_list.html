@@ -24,7 +24,7 @@
       <td>{{ e.company_domain }}</td>
       <td>{{ e.contact_name }}</td>
       <td>
-        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+        <form action="/sent/{{ c.id }}/{{ e.id }}/update" method="post">
           <input class="inline-input" name="contact_email" value="{{ e.contact_email }}">
       </td>
       <td>
@@ -36,14 +36,14 @@
       <td>
         {% if e.confirmed_sent %}<span class="ok">✓</span>
         {% else %}
-        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+        <form action="/sent/{{ c.id }}/{{ e.id }}/update" method="post">
           <input type="hidden" name="action" value="confirm_sent">
           <button class="secondary outline" style="padding:.2rem .5rem">Confirm</button>
         </form>
         {% endif %}
       </td>
       <td>
-        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post">
+        <form action="/sent/{{ c.id }}/{{ e.id }}/update" method="post">
           <input type="hidden" name="action" value="toggle_interview">
           <button class="{{ '' if e.interview_arranged else 'secondary outline' }}" style="padding:.2rem .5rem">
             {{ "✓ Yes" if e.interview_arranged else "No" }}
@@ -51,7 +51,7 @@
         </form>
       </td>
       <td>
-        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post"
+        <form action="/sent/{{ c.id }}/{{ e.id }}/update" method="post"
               {% if not e.permanently_excluded %}onsubmit="return confirm('Never contact {{ e.contact_email }} again, even after the retention window? You can undo this later.')"{% endif %}>
           <input type="hidden" name="action" value="toggle_permanent">
           <button class="{{ '' if e.permanently_excluded else 'secondary outline' }}" style="padding:.2rem .5rem">
@@ -60,7 +60,7 @@
         </form>
       </td>
       <td>
-        <form action="/sent/{{ c.id }}/{{ loop.index0 }}/update" method="post"
+        <form action="/sent/{{ c.id }}/{{ e.id }}/update" method="post"
               onsubmit="return confirm('{% if e.permanently_excluded %}This entry marks {{ e.contact_email }} as never-contact — removing it makes them reachable by future runs again. Remove anyway?{% else %}Remove this entry?{% endif %}')">
           <input type="hidden" name="action" value="delete">
           <button class="secondary outline" style="padding:.2rem .5rem">✕</button>

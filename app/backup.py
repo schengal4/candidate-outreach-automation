@@ -14,11 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import BASE_DIR, DATA_DIR
+from . import config
 
 logger = logging.getLogger("app.backup")
 
-BACKUP_DIR = BASE_DIR / "data_backups"
+BACKUP_DIR = config.BASE_DIR / "data_backups"
 KEEP_BACKUPS = 14
 MIN_INTERVAL_SECONDS = 24 * 3600  # at most one backup per day
 
@@ -35,11 +35,12 @@ def backup_data_dir(force: bool = False) -> Optional[Path]:
             if age < MIN_INTERVAL_SECONDS:
                 return None
 
+        data_dir = config.settings.DATA_DIR
         target = BACKUP_DIR / f"data-{datetime.now():%Y%m%d-%H%M%S}.zip"
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(DATA_DIR.rglob("*")):
+            for f in sorted(data_dir.rglob("*")):
                 if f.is_file():
-                    zf.write(f, arcname=str(f.relative_to(DATA_DIR)))
+                    zf.write(f, arcname=str(f.relative_to(data_dir)))
 
         existing.append(target)
         for old in existing[:-KEEP_BACKUPS]:

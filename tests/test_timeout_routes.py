@@ -7,7 +7,9 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 from fastapi.testclient import TestClient
 from app.main import app
 from app.models import RunState, RunPhase, CompanyState, CompanyStatus
-from app.pipeline import RUNS
+from app.run_manager import manager
+
+RUNS = manager.runs
 
 client = TestClient(app)
 

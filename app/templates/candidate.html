@@ -89,8 +89,17 @@
 <p><a href="/sent/{{ c.id }}">View sent list</a></p>
 
 <details>
-  <summary>Resume text (as parsed)</summary>
+  <summary>Resume ({{ c.resume_filename }})</summary>
   <pre class="email">{{ c.resume_text }}</pre>
+  <form action="/candidates/{{ c.id }}/resume" method="post" enctype="multipart/form-data">
+    <label>Replace resume (.docx)
+      <input type="file" name="resume" accept=".docx" required>
+    </label>
+    <p class="muted" style="margin-bottom:.5rem">
+      Applies from the next run onward — drafts in existing runs keep the old resume.
+    </p>
+    <button type="submit" class="secondary">Upload new resume</button>
+  </form>
 </details>
 
 <details>

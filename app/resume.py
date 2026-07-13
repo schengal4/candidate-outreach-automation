@@ -5,7 +5,7 @@ from pathlib import Path
 
 from docx import Document
 
-from .config import RESUME_DIR
+from . import config
 from .pdf_convert import docx_to_pdf
 
 MAX_RESUME_CHARS = 30_000
@@ -27,11 +27,11 @@ def extract_docx_text(data: bytes) -> str:
 
 
 def resume_docx_path(candidate) -> Path:
-    return RESUME_DIR / f"{candidate.id}_{candidate.resume_filename}"
+    return config.settings.RESUME_DIR / f"{candidate.id}_{candidate.resume_filename}"
 
 
 def resume_pdf_path(candidate) -> Path:
-    return RESUME_DIR / f"{candidate.id}_{Path(candidate.resume_filename).stem}.pdf"
+    return config.settings.RESUME_DIR / f"{candidate.id}_{Path(candidate.resume_filename).stem}.pdf"
 
 
 def resume_pdf_display_name(candidate) -> str:

@@ -7,7 +7,7 @@ from email import message_from_bytes
 from email.policy import default
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
-from app.pipeline import _unwrap_paragraphs
+from app.draft_hygiene import unwrap_paragraphs as _unwrap_paragraphs
 from app.gmail_client import _build_raw_message
 
 wrapped = (

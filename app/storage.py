@@ -1,84 +1,46 @@
-"""Candidate persistence (JSON file).
+"""Candidate persistence, backed by SQLite (see app/db.py).
 
-The file is small but read on every request (page loads, ownership checks,
-run-panel polls every 3s), so reads are served from an in-memory cache keyed
-by the file's (mtime_ns, size) — the JSON (which embeds every candidate's
-full resume text) is only re-parsed when the file actually changed, including
-edits made outside this process. A lock makes read-modify-write updates
-(save/delete) atomic against each other; without it two concurrent saves
-could each load, mutate, and write, silently dropping one of the changes.
+Candidates are stored as one JSON document per row (the model's own
+to_dict/from_dict tolerance handles schema evolution, same as the legacy
+candidates.json did) plus an indexed, normalized owner_email column for the
+per-account listing query. The old mtime-keyed parse cache and RLock are
+gone — SQLite serves the per-request reads and serializes writers itself.
 """
 
 import json
-import threading
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
-from .config import DATA_DIR
-from .fsutil import atomic_write_text
+from . import db
 from .models import Candidate
-
-CANDIDATES_FILE = DATA_DIR / "candidates.json"
-
-# RLock: save/delete hold it across their whole read-modify-write while
-# _load_all/_save_all re-acquire it internally.
-_lock = threading.RLock()
-_cache: Optional[Dict[str, dict]] = None
-_cache_key: Optional[Tuple[int, int]] = None
-
-
-def _file_key() -> Optional[Tuple[int, int]]:
-    stat = CANDIDATES_FILE.stat()
-    return (stat.st_mtime_ns, stat.st_size)
-
-
-def _load_all() -> Dict[str, dict]:
-    global _cache, _cache_key
-    with _lock:
-        if not CANDIDATES_FILE.exists():
-            _cache, _cache_key = None, None
-            return {}
-        key = _file_key()
-        if _cache is None or key != _cache_key:
-            with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
-                _cache = json.load(f)
-            _cache_key = key
-        # Shallow copy so callers can add/remove entries without mutating the
-        # cache behind its key check (values are only read or replaced whole).
-        return dict(_cache)
-
-
-def _save_all(data: Dict[str, dict]) -> None:
-    global _cache, _cache_key
-    with _lock:
-        atomic_write_text(CANDIDATES_FILE, json.dumps(data, indent=2, ensure_ascii=False))
-        _cache = dict(data)
-        _cache_key = _file_key()
 
 
 def list_candidates(owner_email: Optional[str] = None) -> List[Candidate]:
     """All candidates, or only those owned by `owner_email` when given."""
-    candidates = [Candidate.from_dict(d) for d in _load_all().values()]
-    if owner_email is not None:
-        owner = owner_email.strip().lower()
-        candidates = [c for c in candidates if c.owner_email.strip().lower() == owner]
-    return candidates
+    if owner_email is None:
+        rows = db.query("SELECT data FROM candidates")
+    else:
+        rows = db.query(
+            "SELECT data FROM candidates WHERE owner_email = ?",
+            (owner_email.strip().lower(),),
+        )
+    return [Candidate.from_dict(json.loads(r["data"])) for r in rows]
 
 
 def get_candidate(candidate_id: str) -> Optional[Candidate]:
-    d = _load_all().get(candidate_id)
-    return Candidate.from_dict(d) if d else None
+    rows = db.query("SELECT data FROM candidates WHERE id = ?", (candidate_id,))
+    return Candidate.from_dict(json.loads(rows[0]["data"])) if rows else None
 
 
 def save_candidate(candidate: Candidate) -> None:
-    with _lock:
-        data = _load_all()
-        data[candidate.id] = candidate.to_dict()
-        _save_all(data)
+    db.execute(
+        "INSERT OR REPLACE INTO candidates (id, owner_email, data) VALUES (?, ?, ?)",
+        (
+            candidate.id,
+            candidate.owner_email.strip().lower(),
+            json.dumps(candidate.to_dict(), ensure_ascii=False),
+        ),
+    )
 
 
 def delete_candidate(candidate_id: str) -> None:
-    with _lock:
-        data = _load_all()
-        if candidate_id in data:
-            del data[candidate_id]
-            _save_all(data)
+    db.execute("DELETE FROM candidates WHERE id = ?", (candidate_id,))

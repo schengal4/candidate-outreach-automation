@@ -1,5 +1,17 @@
 {# Polled partial — renders according to run phase. #}
 
+{# Contact link: the verified profile URL when we have one, otherwise a
+   LinkedIn people-search for name + company. A search link is never wrong;
+   a guessed profile link can be — unverified URLs are dropped upstream, so
+   the fallback carries the weight. #}
+{% macro linkedin_link(ct, company_name, label, search_label) -%}
+{%- if ct.linkedin_url -%}
+<a href="{{ ct.linkedin_url }}" target="_blank">{{ label }}</a>
+{%- else -%}
+<a href="https://www.linkedin.com/search/results/people/?keywords={{ (ct.full_name ~ ' ' ~ company_name) | urlencode }}" target="_blank">{{ search_label }}</a>
+{%- endif -%}
+{%- endmacro %}
+
 {% if run.phase == "discovering" %}
 <p aria-busy="true">Discovering target companies with web research… this can take a couple of minutes.</p>
 <p class="muted">{{ run.activity or "Starting up…" }}</p>
@@ -7,16 +19,26 @@
 {% elif run.phase == "review" %}
 <h3>Review the shortlist</h3>
 <p>Uncheck any company you want to exclude. Only approved companies continue to contact research.</p>
+<p class="muted">Extra companies beyond your per-run target are backups: they start only if
+   another company fails (no verifiable contact, no email found), so approving all of them
+   won't enlarge the run — it protects the number of drafts you get.</p>
 <form action="/runs/{{ run.id }}/approve" method="post">
   <table>
     <thead><tr><th></th><th>Company</th><th>Domain</th><th>Why</th></tr></thead>
     <tbody>
       {% for comp in run.discovered %}
       <tr>
-        <td><input type="checkbox" name="approved" value="{{ comp.domain }}" checked></td>
+        {# Companies that failed in a previous run start unchecked — retrying
+           a known failure should be an explicit choice, not a silent repeat. #}
+        <td><input type="checkbox" name="approved" value="{{ comp.domain }}"
+                   {% if not comp.failed_before %}checked{% endif %}></td>
         <td>{{ comp.name }}</td>
         <td class="muted">{{ comp.domain }}</td>
-        <td class="muted">{{ comp.reason }}</td>
+        <td class="muted">{{ comp.reason }}
+          {% if comp.failed_before %}
+          <br><span class="drop">failed last time — {{ comp.failed_before }}. Check the box to retry anyway.</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>
@@ -34,7 +56,7 @@
 <form action="/runs/{{ run.id }}/stop_early" method="post">
   <button type="submit" class="secondary">Stop now &amp; view emails completed so far</button>
 </form>
-<p class="muted">This run stops automatically after 30 minutes either way.</p>
+<p class="muted">This run stops automatically after {{ hard_timeout_minutes }} minutes either way.</p>
 {% endif %}
 
 <table>
@@ -46,6 +68,7 @@
       <td>
         {% if comp.status == "done" %}<span class="ok">done</span>
         {% elif comp.status == "dropped" %}<span class="drop">dropped — {{ comp.drop_reason }}</span>
+        {% elif comp.status == "pending" %}<span class="muted">standby — starts if another company fails</span>
         {% else %}
           {{ comp.status }}…
           {% if comp.activity %}<br><span class="muted">{{ comp.activity }}</span>{% endif %}
@@ -69,7 +92,21 @@
   <li>Drafts generated: <strong>{{ s.drafts }}</strong></li>
   <li>Dropped: <strong>{{ s.dropped | length }}</strong>
     {% if s.dropped %}
-    <ul>{% for d in s.dropped %}<li class="muted">{{ d.name }} — {{ d.drop_reason }}</li>{% endfor %}</ul>
+    <ul>{% for d in s.dropped %}
+      <li class="muted">{{ d.name }} — {{ d.drop_reason }}
+        {# Salvage: a found contact is still actionable without an email —
+           surface them for manual LinkedIn outreach instead of discarding. #}
+        {% for ct in [d.primary, d.backup] %}{% if ct and ct.full_name %}
+        <br><span>&nbsp;&nbsp;found {{ ct.full_name }} ({{ ct.title }}) —
+          {% if ct.employment_verified %}employment verified{% else %}employment unverified{% endif %},
+          {{ linkedin_link(ct, d.name, "reach out on LinkedIn", "search LinkedIn for them") }}{% if ct.verification_caveat %}
+          <br>&nbsp;&nbsp;<span class="drop">⚠ verify first: {{ ct.verification_caveat }}</span>{% endif %}</span>
+        {% endif %}{% endfor %}
+      </li>
+    {% endfor %}</ul>
+    <span class="muted">Contact details under dropped companies are as of the
+    identification step — dropped companies skip the draft fact-check, so
+    verify role and profile yourself before reaching out.</span>
     {% endif %}
   </li>
 </ul>
@@ -82,12 +119,24 @@
   <header>
     <strong>{{ comp.name }}</strong> <span class="muted">({{ comp.domain }})</span><br>
     {{ comp.contact_used.full_name }} — {{ comp.contact_used.title }}
-    {% if comp.contact_used.linkedin_url %}
-      · <a href="{{ comp.contact_used.linkedin_url }}" target="_blank">LinkedIn</a>
-    {% endif %}
+    · {{ linkedin_link(comp.contact_used, comp.name, "LinkedIn", "search LinkedIn") }}
+    {% if comp.email %}
     <br><span class="muted">Email: {{ comp.email }}
       {% if comp.email_score is not none %}(Hunter score {{ comp.email_score }}){% endif %}</span>
+    {% else %}
+    <br><span class="muted">No verified email found — draft is for manual outreach.</span>
+    {% endif %}
   </header>
+
+  {% if comp.contact_used.verification_caveat %}
+  <div class="flag">
+    <strong>⚠ Verify this contact before sending.</strong>
+    {{ comp.contact_used.verification_caveat }}
+    {{ linkedin_link(comp.contact_used, comp.name,
+                     "Open LinkedIn to check their current role.",
+                     "Search LinkedIn to check their current role.") }}
+  </div>
+  {% endif %}
 
   {% if comp.red_flags %}
   <div class="flag">
@@ -96,12 +145,44 @@
   </div>
   {% endif %}
 
+  {% if comp.draft_banned_phrases %}
+  <div class="flag">
+    <strong>⚠ Review the wording before sending.</strong>
+    This draft still uses phrasing the style rules try to avoid
+    ({{ comp.draft_banned_phrases | join(", ") }}). A quick manual edit is worth it.
+  </div>
+  {% endif %}
+
+  {% if comp.draft_flagged_claims %}
+  <div class="flag">
+    <strong>⚠ Check these claims before sending.</strong>
+    A fact-check pass could not ground everything this draft asserts — verify
+    (or soften) these, they may overstate what the sources actually say:
+    <ul>{% for cl in comp.draft_flagged_claims %}<li>{{ cl }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  {% if comp.draft_verify_error %}
+  <div class="flag">
+    <strong>⚠ This draft was not fact-checked.</strong>
+    The fact-check step failed ({{ comp.draft_verify_error }}) — double-check
+    the contact's role and any product or company claims yourself before sending.
+  </div>
+  {% endif %}
+
   <details>
     <summary>Employment evidence &amp; research</summary>
     <p><strong>Evidence:</strong> {{ comp.contact_used.evidence }}</p>
     <p><strong>Research:</strong> {{ comp.research_summary }}</p>
     {% if comp.research_items %}
-    <ul>{% for item in comp.research_items %}<li>{{ item }}</li>{% endfor %}</ul>
+    <ul>{% for item in comp.research_items %}
+      {# Structured items carry provenance; run files from before the
+         fact/source/date/url schema hold plain strings. #}
+      <li>{% if item is mapping %}{{ item.fact }}
+        {% if item.source or item.date %}<span class="muted">— {{ item.source }}{% if item.source and item.date %}, {% endif %}{{ item.date }}</span>{% endif %}
+        {% if item.url %} · <a href="{{ item.url }}" target="_blank">source</a>{% endif %}
+      {% else %}{{ item }}{% endif %}</li>
+    {% endfor %}</ul>
     {% endif %}
   </details>
 
@@ -110,7 +191,10 @@
   <pre class="email" id="body-{{ loop.index }}">{{ comp.draft_body }}</pre>
   <button onclick="copyText('body-{{ loop.index }}', this)">Copy email body</button>
 
-  {% if gmail_connected %}
+  {% if not comp.email %}
+  <p class="muted">No email address to send to. You may consider reaching out via LinkedIn InMail
+    — {{ linkedin_link(comp.contact_used, comp.name, "open their LinkedIn", "search LinkedIn for them") }}.</p>
+  {% elif gmail_connected %}
   <p>
     {% if comp.gmail_draft_created %}
       <span class="ok">✓ Saved to Gmail Drafts</span>
@@ -131,6 +215,7 @@
    reviewing each draft's factual claims first is still the point. #}
 {% if gmail_connected %}
 {% set unsaved = run.companies | selectattr("status", "equalto", "done")
+                               | selectattr("email")
                                | rejectattr("gmail_draft_created") | list %}
 {% if unsaved | length > 1 %}
 <form action="/runs/{{ run.id }}/save_all_to_gmail" method="post">

@@ -50,8 +50,12 @@ async def test_cache_prefix_shapes_the_request():
     assert result == {"ok": True}
 
     kwargs = captured_kwargs[0]
+    # ask_json prepends a "Today's date: ..." anchor so the model can judge
+    # what "recent" means; it's constant within a run, so caching still works.
+    from datetime import date
+    expected_system = f"Today's date: {date.today().isoformat()}.\n\nSYSTEM PROMPT"
     assert kwargs["system"] == [
-        {"type": "text", "text": "SYSTEM PROMPT", "cache_control": {"type": "ephemeral"}}
+        {"type": "text", "text": expected_system, "cache_control": {"type": "ephemeral"}}
     ], kwargs["system"]
     content = kwargs["messages"][0]["content"]
     assert content == [

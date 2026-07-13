@@ -14,12 +14,13 @@ import app.backup as backup
 with tempfile.TemporaryDirectory() as td:
     backup.BACKUP_DIR = Path(td)
 
-    # 1. First call creates a zip containing the real data files
+    # 1. First call creates a zip containing the real data files — above all
+    #    app.db, which now holds candidates, sent lists, and runs
     first = backup.backup_data_dir()
     assert first is not None and first.exists()
     names = zipfile.ZipFile(first).namelist()
-    assert "candidates.json" in names, names
-    print("PASS: backup zip created and contains candidates.json")
+    assert "app.db" in names, names
+    print("PASS: backup zip created and contains app.db")
 
     # 2. Immediate second call is skipped (newest backup is fresh)
     assert backup.backup_data_dir() is None

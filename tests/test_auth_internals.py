@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 import app.auth as auth
+from app import config
 from app.auth import LoginError
 
 
@@ -65,7 +66,7 @@ except LoginError as e:
 print("PASS: unverified email is rejected")
 
 # 4. Allowlist enforced
-auth.ALLOWED_LOGIN_EMAILS = {"venkatachengalvala@gmail.com"}
+config.settings.ALLOWED_LOGIN_EMAILS = {"venkatachengalvala@gmail.com"}
 CLAIMS.update({"email": "intruder@example.com", "email_verified": True})
 try:
     auth.handle_login_callback("code", state_from(auth.build_login_url()))

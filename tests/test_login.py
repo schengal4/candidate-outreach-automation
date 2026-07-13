@@ -8,12 +8,13 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 import app.auth as auth_mod
+from app import config
 from app.auth import LoginError
 
 client = TestClient(main.app)
 
 # --- Guard behavior with login required (the live configuration) ---
-main.LOGIN_REQUIRED = True
+config.settings.LOGIN_REQUIRED = True
 
 resp = client.get("/", follow_redirects=False)
 assert resp.status_code == 303 and resp.headers["location"] == "/login", (resp.status_code, resp.headers.get("location"))
@@ -63,7 +64,7 @@ assert "access_denied" in resp.text
 print("PASS: provider errors are shown on the login page")
 
 # --- Login disabled -> app runs open (pre-auth behavior preserved) ---
-main.LOGIN_REQUIRED = False
+config.settings.LOGIN_REQUIRED = False
 resp = client.get("/", follow_redirects=False)
 assert resp.status_code == 200
 resp = client.get("/login", follow_redirects=False)

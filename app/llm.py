@@ -11,19 +11,15 @@ import json
 import logging
 import random
 import re
+import time
+from datetime import date
 from typing import Any, Callable, List, Optional
 
 import anthropic
 
 logger = logging.getLogger("app.llm")
 
-from .config import (
-    ANTHROPIC_MODEL,
-    LLM_CALL_TIMEOUT_SECONDS,
-    LLM_MAX_TOKENS,
-    MAX_PAUSE_TURN_CONTINUATIONS,
-    WEB_SEARCH_MAX_USES,
-)
+from . import config
 
 _client: Optional[anthropic.AsyncAnthropic] = None
 
@@ -52,6 +48,14 @@ def get_client() -> anthropic.AsyncAnthropic:
 
 class LLMError(Exception):
     pass
+
+
+class LLMTimeoutError(LLMError):
+    """The per-call safety valve fired (LLM_CALL_TIMEOUT_SECONDS or a
+    step-specific override). Distinct from LLMError so callers can retry
+    timeouts specifically — a timed-out call usually wandered (too many
+    searches, marathon thinking) and often succeeds on a tighter budget,
+    whereas refusals/truncation/parse failures wouldn't."""
 
 
 def extract_json(text: str) -> Any:
@@ -128,12 +132,14 @@ async def ask_json(
     system: str,
     user: str,
     web_search: bool = False,
-    max_tokens: int = LLM_MAX_TOKENS,
+    max_tokens: Optional[int] = None,
     on_progress: Optional[Callable[[str], None]] = None,
     label: str = "",
     cache_prefix: Optional[str] = None,
     effort: Optional[str] = None,
     schema: Optional[dict] = None,
+    max_uses: Optional[int] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> Any:
     """One Claude request; returns the parsed JSON payload of the reply.
 
@@ -162,15 +168,26 @@ async def ask_json(
     JSON matching it. Without it, replies occasionally carry an unescaped
     quote or raw newline inside a JSON string and the parse below fails after
     all the expensive upstream work has already been paid for.
+
+    `max_uses` / `timeout_seconds` override the default web-search budget and
+    per-call time limit — used to keep contact-identification calls (which
+    reliably spend their entire budget) on a shorter leash than research.
     """
     client = get_client()
+    call_timeout = timeout_seconds or config.settings.LLM_CALL_TIMEOUT_SECONDS
+    if max_tokens is None:
+        max_tokens = config.settings.LLM_MAX_TOKENS
+    # Anchor "now": without this the model judges words like "recent" against
+    # its training data — a real run framed a 16-month-old funding round as
+    # news. Constant within a run, so system-prompt caching is unaffected.
+    system = f"Today's date: {date.today().isoformat()}.\n\n{system}"
     tools: List[dict] = []
     if web_search:
         tools.append(
             {
                 "type": "web_search_20260209",
                 "name": "web_search",
-                "max_uses": WEB_SEARCH_MAX_USES,
+                "max_uses": max_uses or config.settings.WEB_SEARCH_MAX_USES,
             }
         )
 
@@ -192,9 +209,9 @@ async def ask_json(
     messages: List[dict] = [{"role": "user", "content": content}]
     container_id: Optional[str] = None
 
-    for attempt in range(MAX_PAUSE_TURN_CONTINUATIONS + 1):
+    for attempt in range(config.settings.MAX_PAUSE_TURN_CONTINUATIONS + 1):
         kwargs: dict = dict(
-            model=ANTHROPIC_MODEL,
+            model=config.settings.ANTHROPIC_MODEL,
             max_tokens=max_tokens,
             # system/tools text is identical across every call of this type in
             # a run (it never varies per company) — its own breakpoint here
@@ -229,22 +246,38 @@ async def ask_json(
         # retries). Web-search calls on hard companies have run 20+ minutes
         # as one request — better to drop that company with a clear reason
         # than let it ride until the run-wide timeout kills the whole run.
+        attempt_started = time.monotonic()
         try:
             msg = await asyncio.wait_for(
-                _send_request(client, kwargs, report), timeout=LLM_CALL_TIMEOUT_SECONDS
+                _send_request(client, kwargs, report), timeout=call_timeout
             )
         except asyncio.TimeoutError:
-            raise LLMError(
-                f"LLM call timed out after {LLM_CALL_TIMEOUT_SECONDS // 60} minutes."
+            # Without this line, the slowest calls (the ones that matter most
+            # for speed diagnosis) would leave no usage/timing trace at all.
+            logger.warning(
+                "%s attempt %d: timed out after %.0fs (request abandoned mid-stream)",
+                label or "call", attempt + 1, time.monotonic() - attempt_started,
+            )
+            # Name the step in the message — it becomes the company's drop
+            # reason in the run report, and "LLM call timed out" alone made
+            # real runs undiagnosable without the log file.
+            raise LLMTimeoutError(
+                f"LLM call timed out after {call_timeout // 60} minutes"
+                + (f" ({label})" if label else "") + "."
             )
 
         if msg.container:
             container_id = msg.container.id
 
         u = msg.usage
+        # Web searches happen server-side inside the request; the count is the
+        # main driver of a call's duration (each search is a think+read round).
+        server_tools = getattr(u, "server_tool_use", None)
+        searches = getattr(server_tools, "web_search_requests", 0) or 0
         logger.info(
-            "%s attempt %d: stop=%s input=%d output=%d cache_write=%d cache_read=%d",
+            "%s attempt %d: stop=%s took=%.0fs searches=%d input=%d output=%d cache_write=%d cache_read=%d",
             label or "call", attempt + 1, msg.stop_reason,
+            time.monotonic() - attempt_started, searches,
             u.input_tokens, u.output_tokens,
             u.cache_creation_input_tokens, u.cache_read_input_tokens,
         )

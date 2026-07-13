@@ -29,13 +29,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
-from .config import (
-    GMAIL_SCOPES,
-    GMAIL_TOKENS_DIR,
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET,
-    GOOGLE_REDIRECT_URI,
-)
+from . import config
 from .fsutil import atomic_write_text
 from .models import Candidate, CompanyState
 from .resume import ensure_resume_pdf, resume_pdf_display_name
@@ -48,7 +42,7 @@ class GmailNotConfigured(Exception):
 
 
 def _require_configured() -> None:
-    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+    if not (config.settings.GOOGLE_CLIENT_ID and config.settings.GOOGLE_CLIENT_SECRET):
         raise GmailNotConfigured(
             "Gmail integration isn't configured — set GOOGLE_CLIENT_ID and "
             "GOOGLE_CLIENT_SECRET (see README)."
@@ -56,19 +50,20 @@ def _require_configured() -> None:
 
 
 def _client_config() -> dict:
+    s = config.settings
     return {
         "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
+            "client_id": s.GOOGLE_CLIENT_ID,
+            "client_secret": s.GOOGLE_CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI],
+            "redirect_uris": [s.GOOGLE_REDIRECT_URI],
         }
     }
 
 
 def _token_path(candidate_id: str):
-    return GMAIL_TOKENS_DIR / f"{candidate_id}.json"
+    return config.settings.GMAIL_TOKENS_DIR / f"{candidate_id}.json"
 
 
 def is_connected(candidate_id: str) -> bool:
@@ -88,7 +83,9 @@ def build_auth_url(candidate_id: str) -> str:
     """Start the OAuth flow. `candidate_id` is round-tripped via `state`."""
     _require_configured()
     flow = Flow.from_client_config(
-        _client_config(), scopes=GMAIL_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI
+        _client_config(),
+        scopes=list(config.settings.GMAIL_SCOPES),
+        redirect_uri=config.settings.GOOGLE_REDIRECT_URI,
     )
     # access_type=offline + prompt=consent guarantee a refresh_token is
     # issued, including on a repeat authorization by the same user.
@@ -105,8 +102,8 @@ def handle_oauth_callback(code: str, candidate_id: str) -> None:
     code_verifier = _pending_verifiers.pop(candidate_id, None)
     flow = Flow.from_client_config(
         _client_config(),
-        scopes=GMAIL_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI,
+        scopes=list(config.settings.GMAIL_SCOPES),
+        redirect_uri=config.settings.GOOGLE_REDIRECT_URI,
         code_verifier=code_verifier,
     )
     flow.fetch_token(code=code)
@@ -123,7 +120,9 @@ def _load_credentials(candidate_id: str) -> Optional[Credentials]:
     if not path.exists():
         return None
     info = json.loads(path.read_text(encoding="utf-8"))
-    creds = Credentials.from_authorized_user_info(info, scopes=GMAIL_SCOPES)
+    creds = Credentials.from_authorized_user_info(
+        info, scopes=list(config.settings.GMAIL_SCOPES)
+    )
     if creds.expired and creds.refresh_token:
         creds.refresh(GoogleAuthRequest())
         _save_credentials(candidate_id, creds)  # access token rotated — persist it

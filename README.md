@@ -4,7 +4,7 @@ Implements the pipeline in [plan.md](plan.md): LLM company discovery → candida
 review gate → contact identification (primary + backup, employment verified with
 dated evidence) → gated Hunter email lookup → personalization research (optional
 red-flag detection) → personalized draft with a plain sign-off → per-candidate
-Sent List (CSV) with retention-window exclusion and reconciliation nudge.
+Sent List with retention-window exclusion and reconciliation nudge.
 
 ## Setup
 
@@ -50,7 +50,8 @@ Open http://127.0.0.1:8000
    responses are retried with backoff (see `app/llm.py`) rather than dropping
    the company. A "stop now & view emails completed so far" button appears
    on the run page after 10 minutes; the run also stops itself automatically
-   after 30 minutes regardless, keeping whatever companies already finished.
+   after 40 minutes regardless (`RUN_HARD_TIMEOUT_SECONDS` to override),
+   keeping whatever companies already finished.
 4. **Results** — per company: contact used + employment evidence, email +
    Hunter score, research summary, red flags (if enabled, shown alongside the
    draft — your call), draft with one-click copy. A plain sign-off (name, email,
@@ -150,30 +151,42 @@ sharing the same OAuth client. See `app/auth.py`.
 Automatic_Email_Generation/
 ├── app/
 │   ├── __init__.py
-│   ├── config.py
+│   ├── config.py        # Settings object (env read once; overridable in-process)
 │   ├── models.py
+│   ├── db.py            # the single SQLite store + one-time legacy-file import
+│   ├── storage.py       # candidates (over db.py)
+│   ├── sent_list.py     # sent list (over db.py)
+│   ├── run_store.py     # run reports + cost-cap ledger (over db.py)
+│   ├── fsutil.py        # atomic writes for the remaining real files (resumes, tokens)
 │   ├── resume.py
-│   ├── storage.py
-│   ├── sent_list.py
-│   ├── llm.py
-│   ├── hunter_async.py
 │   ├── pdf_convert.py
+│   ├── llm.py
+│   ├── prompts.py       # every prompt + JSON schema, nothing executable
+│   ├── steps.py         # pipeline steps as pure functions (inputs → result objects)
+│   ├── draft_hygiene.py # deterministic draft post-processing / banned-style backstop
+│   ├── pipeline.py      # orchestration only — sequences steps, owns run state
+│   ├── run_manager.py   # run lifecycle: registry, task spawning, daily cap, pruning
+│   ├── deps.py          # per-account ownership as FastAPI dependencies
+│   ├── auth.py
 │   ├── gmail_client.py
-│   ├── pipeline.py
-│   ├── main.py
+│   ├── hunter_async.py
+│   ├── backup.py
+│   ├── logging_setup.py
+│   ├── main.py          # create_app() factory + routes; startup work in lifespan
 │   └── templates/
 │       ├── base.html
 │       ├── index.html
 │       ├── candidate.html
 │       ├── gmail_connect.html
+│       ├── login.html
 │       ├── run.html
 │       ├── _run_panel.html
 │       └── sent_list.html
 ├── data/
-│   ├── candidates.json
+│   ├── app.db           # candidates, sent lists, runs, run ledger (SQLite)
 │   ├── resumes/
 │   ├── gmail_tokens/
-│   └── sent_list_<id>.csv
+│   └── logs/
 ├── hunter_client.py
 ├── Hunter_API_Documentation.md
 ├── Email_Target_Identification.py
@@ -191,19 +204,26 @@ Automatic_Email_Generation/
 | File | What it does |
 |---|---|
 | `__init__.py` | Empty — just marks this folder as a Python package. Nothing to see here. |
-| `config.py` | All the tunable settings in one place: which Claude model to use, how many companies to research per run, rate limits, retention-window defaults. |
+| `config.py` | All the tunable settings, on one `Settings` object (`config.settings`): which Claude model to use, how many companies to research per run, rate limits, retention-window defaults. Env vars are read once at import; tests can override any value in-process. Importing it has no side effects (no directories created, no secrets written). |
 | `logging_setup.py` | Wires up app-wide logging: everything the app logs goes to the console **and** a rotating file at `data/logs/app.log` (so a run's history survives closing the terminal). Set the `LOG_LEVEL` env var (`DEBUG`, `INFO`, `WARNING`, `ERROR`) to change verbosity; default is `INFO`. |
 | `models.py` | The "shapes" of the app's data — blank forms that get filled in as things run, e.g. what a Candidate looks like, what a Contact looks like, what a Run looks like. |
+| `db.py` | The single SQLite database (`data/app.db`) behind candidates, sent lists, and runs — plus a one-time import of the older per-file formats (`candidates.json`, `sent_list_*.csv`, `runs/*.json`) the first time it runs; the legacy files are left in place untouched. Also holds the never-pruned run ledger the daily cost cap counts. |
 | `resume.py` | Opens an uploaded `.docx` resume and pulls the plain text out of it so Claude can read it. Also owns where resume files live on disk and keeps a cached PDF copy for email attachments. |
 | `pdf_convert.py` | Converts the uploaded `.docx` resume to PDF using the locally installed MS Word (no LLM, no cloud service — a faithful render of the file). Windows-only; requires Word. |
 | `auth.py` | Google Sign-In for the app itself (identity only — name and email). Separate flow from the Gmail drafts connection; powers the login wall in `main.py`. |
-| `storage.py` | Saves and loads candidate profiles to/from a JSON file — the "candidate database." |
-| `sent_list.py` | Tracks who's been contacted per candidate (the CSV "Sent List"): who, when, whether they confirmed sending, whether an interview happened, and enforces the "don't recontact the same person within X months" rule. |
+| `deps.py` | Per-account data isolation as FastAPI dependencies: a route can't receive a candidate or run without the ownership check having run. |
+| `storage.py` | Saves and loads candidate profiles — the "candidate database" (a table in `app.db`). |
+| `sent_list.py` | Tracks who's been contacted per candidate (the "Sent List" table): who, when, whether they confirmed sending, whether an interview happened, and enforces the "don't recontact the same person within X months" rule. Every entry has a stable id, so edits can't hit the wrong row while a run is appending. |
+| `run_store.py` | Persists run reports (checkpointed during a run, reloaded at startup) and the run ledger. Report retention and the daily cost cap are independent — pruning old reports can't reset the cap. |
 | `llm.py` | Talks to Claude: sends requests, lets it search the web, and streams back live "what am I doing right now" updates so the UI doesn't look frozen during a long web-search call. |
+| `prompts.py` | Every prompt and JSON schema the pipeline sends, in one non-executable module — the single place to read or edit what the model is asked to do. |
+| `steps.py` | The pipeline's individual steps as pure functions: explicit inputs in, result objects out. Nothing here mutates run state. |
+| `draft_hygiene.py` | Deterministic post-processing of drafts: greeting/closing guarantees, paragraph fixing, and the banned-phrase backstop for wording the prompt rules alone don't hold. |
 | `hunter_async.py` | Wraps the pre-existing Hunter.io email-lookup client so several lookups can run at the same time without overloading Hunter's rate limit. |
 | `gmail_client.py` | Handles the Gmail OAuth flow and creates drafts in a connected candidate's Gmail account. Drafts only — never calls the send endpoint. |
-| `pipeline.py` | The brain of the app — runs the actual outreach process step by step: find companies → find contacts at each company → verify they still work there → find their email → research them → write a personalized email. |
-| `main.py` | The web server — defines every page/URL (create candidate, view a run, view sent list, etc.) and connects user clicks to the pipeline logic above. |
+| `pipeline.py` | The orchestrator — sequences the steps for each company (find contact → verify → email → research → draft → fact-check), applies their results to run state, and handles the bench/backfill, checkpoints, and timeouts. |
+| `run_manager.py` | Owns the run lifecycle: the in-memory run registry, background-task spawning, the daily run cap, pruning, and stop-early — the one writer of run bookkeeping. |
+| `main.py` | The web server — `create_app()` builds the app; startup work (logging, backup, DB migration, reloading persisted runs) happens in the lifespan handler, and every page/URL is a thin route over the pieces above. |
 
 **`app/templates/` — the actual HTML pages the browser shows**
 
@@ -221,7 +241,7 @@ Automatic_Email_Generation/
 
 | File/folder | What it does |
 |---|---|
-| `data/` | The app's storage — created automatically the first time you run it. Holds `candidates.json` (all saved candidate profiles), `resumes/` (uploaded resume files), `gmail_tokens/` (one OAuth token file per connected candidate), one `sent_list_<id>.csv` per candidate, and `logs/` (the app's log files, rotated). Gitignored. |
+| `data/` | The app's storage — created automatically the first time you run it. Holds `app.db` (candidates, sent lists, runs — SQLite), `resumes/` (uploaded resume files), `gmail_tokens/` (one OAuth token file per connected candidate, deliberately kept outside the DB), and `logs/` (the app's log files, rotated). Pre-SQLite files (`candidates.json`, `sent_list_*.csv`, `runs/`) are imported into `app.db` on first start and left in place as a fallback copy. Gitignored. |
 | `.gitignore` | Excludes `data/` (personal info + OAuth tokens) and the `.env/` virtualenv from git. |
 | `hunter_client.py` | Pre-existing helper that knows how to call the Hunter.io API directly (look up an email, verify one, etc.) — `app/hunter_async.py` wraps this so the web app can use it without blocking. |
 | `Hunter_API_Documentation.md` | Reference notes for the Hunter.io API. |
@@ -236,8 +256,9 @@ Automatic_Email_Generation/
 - Daily auto-run, Hunter Discover pre-filter, LinkedIn PDF upload for research,
   per-company resume tailoring, Outlook draft creation, caching — all V2.
   (Gmail draft creation is implemented — see "Gmail integration" above.)
-- Runs persist to disk (`data/runs/`, one JSON per run, last 5 kept per
-  profile) and reload on startup, so a restart doesn't lose finished reports —
+- Runs persist to the database (last 5 reports kept per profile; the cost-cap
+  ledger is never pruned) and reload on startup, so a restart doesn't lose
+  finished reports —
   the profile page lists recent runs. A run caught mid-flight can't resume its
   LLM work: after a restart, companies already finished keep their drafts,
   in-flight ones are marked "interrupted by server restart", and a run parked

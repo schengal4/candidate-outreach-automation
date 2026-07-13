@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+
+def normalize_linkedin_url(url: Any) -> str:
+    """Prefix https:// onto scheme-less LinkedIn URLs. The model sometimes
+    returns "linkedin.com/in/x", which templates would render as a relative
+    href (the run report once linked http://localhost:8000/runs/linkedin.com/…).
+    Applied at the model boundary (Contact.from_dict), so persisted runs from
+    before the fix are also repaired on load."""
+    url = str(url or "").strip()
+    if url and not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    return url
 
 
 # ------------------------------------------------------------------ #
@@ -59,6 +72,13 @@ class Contact:
     linkedin_url: str = ""
     employment_verified: bool = False
     evidence: str = ""
+    # A one-line "double-check this before sending" warning, set when the
+    # evidence is credible-but-soft: founder/C-suite titles that persist on
+    # undated team pages long after a departure, aging dated sources, or
+    # recent transition-flavored company content. Separate from
+    # employment_verified (which still gates the email lookup) — a caveat
+    # means "probably still there, but confirm", not "unverified".
+    verification_caveat: str = ""
 
     @property
     def full_name(self) -> str:
@@ -75,9 +95,10 @@ class Contact:
             first_name=str(d.get("first_name", "") or ""),
             last_name=str(d.get("last_name", "") or ""),
             title=str(d.get("title", "") or ""),
-            linkedin_url=str(d.get("linkedin_url", "") or ""),
+            linkedin_url=normalize_linkedin_url(d.get("linkedin_url", "")),
             employment_verified=bool(d.get("employment_verified", False)),
             evidence=str(d.get("evidence", "") or ""),
+            verification_caveat=str(d.get("verification_caveat", "") or ""),
         )
 
 
@@ -90,6 +111,7 @@ class CompanyStatus:
     EMAIL = "looking up email"
     RESEARCH = "researching"
     DRAFTING = "drafting"
+    VERIFYING = "fact-checking draft"
     DONE = "done"
     DROPPED = "dropped"
 
@@ -108,10 +130,27 @@ class CompanyState:
     email: str = ""
     email_score: Optional[int] = None
     research_summary: str = ""
-    research_items: List[str] = field(default_factory=list)
+    # Structured items: {"fact", "source", "date", "url"} dicts. Run files
+    # persisted before the structured research schema hold plain strings —
+    # the report template tolerates both shapes.
+    research_items: List[Any] = field(default_factory=list)
     red_flags: List[str] = field(default_factory=list)
     draft_subject: str = ""
     draft_body: str = ""
+    # Banned style phrasings that survived the draft's one redraft attempt.
+    # Empty on a clean draft. The pipeline can't hard-block these without
+    # risking an infinite redraft loop, so a non-empty list surfaces a
+    # "review the wording" flag in the run report instead of shipping silently.
+    draft_banned_phrases: List[str] = field(default_factory=list)
+    # Claims the post-draft fact-check (pipeline step 6) could not ground in
+    # the research notes or confirm by web search — "unsupported: ..." /
+    # "unverified: ..." strings shown as a review flag in the run report.
+    # Empty on a clean draft.
+    draft_flagged_claims: List[str] = field(default_factory=list)
+    # Non-empty when the fact-check call itself failed: the draft is kept
+    # (the check is a safety net, not a gate) but the report tells the user
+    # this one was never checked.
+    draft_verify_error: str = ""
     gmail_draft_created: bool = False
     gmail_error: str = ""
 
@@ -153,8 +192,11 @@ class RunState:
     activity: str = ""  # live progress text during discovery
     # discovery output (shown at the review gate)
     discovered: List[Dict[str, str]] = field(default_factory=list)
-    # per-company pipeline states (populated after approval)
+    # per-company pipeline states (populated after approval). Unused bench
+    # companies are removed at run end, so this can end up shorter than what
+    # the user approved — approved_count preserves the review-gate number.
     companies: List[CompanyState] = field(default_factory=list)
+    approved_count: int = 0
     # set when phase -> RUNNING; drives the timeout-button / hard-timeout logic
     started_running_at: Optional[float] = None
     # set when the run reaches DONE or ERROR; freezes the elapsed-time display
@@ -179,6 +221,7 @@ class RunState:
             "activity": self.activity,
             "discovered": self.discovered,
             "companies": [c.to_dict() for c in self.companies],
+            "approved_count": self.approved_count,
             "started_running_at": self.started_running_at,
             "finished_at": self.finished_at,
             "created_at": self.created_at,
@@ -192,6 +235,7 @@ class RunState:
         run.activity = str(d.get("activity", ""))
         run.discovered = list(d.get("discovered", []))
         run.companies = [CompanyState.from_dict(cd) for cd in d.get("companies", [])]
+        run.approved_count = int(d.get("approved_count", 0) or 0)
         run.started_running_at = d.get("started_running_at")
         run.finished_at = d.get("finished_at")  # absent in pre-feature run files
         run.created_at = float(d.get("created_at", time.time()))
@@ -206,7 +250,12 @@ class RunState:
             "drafts": len(done),
             "dropped": dropped,
             "contacts_found": sum(1 for c in self.companies if c.primary or c.backup),
-            "excluded_at_review": max(0, len(self.discovered) - len(self.companies))
+            # approved_count, not len(companies): unused bench companies are
+            # removed from `companies` at run end, and pre-bench run files
+            # have approved_count 0 — fall back to the old formula there.
+            "excluded_at_review": max(
+                0, len(self.discovered) - (self.approved_count or len(self.companies))
+            )
             if self.discovered
             else 0,
         }

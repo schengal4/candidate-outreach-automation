@@ -5,7 +5,7 @@ produced drafts missing one or both, so draft_email enforces them in code
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
-from app.pipeline import _ensure_greeting_and_closing
+from app.draft_hygiene import ensure_greeting_and_closing as _ensure_greeting_and_closing
 
 # Model omitted both (seen in a real run: the PathAI draft opened mid-thought
 # and ended on the ask with no sign-off).

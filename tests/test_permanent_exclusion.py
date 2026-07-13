@@ -1,12 +1,12 @@
 """Verify permanently_excluded overrides the retention window and pruning,
-using a throwaway candidate id so real CSVs are untouched."""
+using a throwaway candidate id so real data is untouched. Also checks the
+legacy-CSV import path (pre-SQLite sent lists keep their flags)."""
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 from app import sent_list
 
 CID = "testpermflag"
-path = sent_list._path(CID)
 try:
     # Two entries sent 3 years ago — far past any retention window (max 18mo).
     sent_list.add_entry(CID, "old.com", "Old Contact", "old@old.com",
@@ -26,19 +26,40 @@ try:
     assert entries[0]["contact_email"] == "never@never.com"
     print("PASS: prune removed the expired entry, kept the permanently excluded one")
 
-    # Toggle off -> the same old entry now expires like any other
-    sent_list.update_entry(CID, 0, permanently_excluded=False)
+    # Toggle off (by stable entry id) -> the same old entry now expires
+    sent_list.update_entry(CID, entries[0]["id"], permanently_excluded=False)
     assert "never@never.com" not in sent_list.active_blocked_emails(CID, 12)
     print("PASS: toggling the flag off restores normal retention behaviour")
 
-    # Old CSVs without the column parse as False
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write("candidate_id,company_domain,contact_name,contact_email,date_sent,interview_arranged,confirmed_sent\n")
-        f.write(f"{CID},legacy.com,Legacy,legacy@legacy.com,2026-07-01,False,True\n")
-    e = sent_list.load_entries(CID)[0]
-    assert e["permanently_excluded"] is False
-    print("PASS: legacy CSV without the column loads with flag False")
+    # An edit addressed to the wrong candidate must not touch the entry
+    sent_list.update_entry("someoneelse", entries[0]["id"], permanently_excluded=True)
+    assert "never@never.com" not in sent_list.active_blocked_emails(CID, 12)
+    print("PASS: entry ids are scoped to their candidate")
 finally:
-    if path.exists():
-        path.unlink()
-        print("cleanup: removed", path.name)
+    sent_list.delete_list(CID)
+    print("cleanup: removed throwaway sent list")
+
+# Legacy CSVs (pre-SQLite) import on first connect; files without the
+# permanently_excluded column load with the flag False.
+import pathlib
+import tempfile
+
+from app import config, db
+
+_original_dir = config.settings.DATA_DIR
+db.close()
+tmp = pathlib.Path(tempfile.mkdtemp())
+(tmp / "sent_list_legacycid.csv").write_text(
+    "candidate_id,company_domain,contact_name,contact_email,date_sent,interview_arranged,confirmed_sent\n"
+    "legacycid,legacy.com,Legacy,legacy@legacy.com,2026-07-01,False,True\n",
+    encoding="utf-8",
+)
+try:
+    config.settings.DATA_DIR = tmp
+    e = sent_list.load_entries("legacycid")[0]
+    assert e["permanently_excluded"] is False
+    assert e["confirmed_sent"] is True and e["contact_email"] == "legacy@legacy.com"
+    print("PASS: legacy CSV without the column imports with flag False")
+finally:
+    db.close()
+    config.settings.DATA_DIR = _original_dir

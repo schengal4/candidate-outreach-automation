@@ -10,13 +10,13 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 import app.auth as auth_mod
-from app import sent_list, storage
+from app import config, sent_list, storage
 from app.models import Candidate
 
 CID = "cumultest01"
 EMAIL = "cumul.test@example.com"
 
-main.LOGIN_REQUIRED = True
+config.settings.LOGIN_REQUIRED = True
 storage.save_candidate(Candidate(id=CID, name="Cumul Test", email="", current_employer="X",
                                  resume_text="r", owner_email=EMAIL))
 client = TestClient(main.app)
@@ -30,9 +30,11 @@ try:
     assert len(sent_list.load_entries(CID)) == 3
 
     # User confirms 2 of them via the real route, sets Never-contact on one
-    client.post(f"/sent/{CID}/0/update", data={"action": "confirm_sent"})
-    client.post(f"/sent/{CID}/1/update", data={"action": "confirm_sent"})
-    client.post(f"/sent/{CID}/1/update", data={"action": "toggle_permanent"})
+    # (entries are addressed by their stable DB id, not by list position)
+    ids = [e["id"] for e in sent_list.load_entries(CID)]
+    client.post(f"/sent/{CID}/{ids[0]}/update", data={"action": "confirm_sent"})
+    client.post(f"/sent/{CID}/{ids[1]}/update", data={"action": "confirm_sent"})
+    client.post(f"/sent/{CID}/{ids[1]}/update", data={"action": "toggle_permanent"})
     entries = sent_list.load_entries(CID)
     assert entries[0]["confirmed_sent"] and entries[1]["confirmed_sent"] and not entries[2]["confirmed_sent"]
     assert entries[1]["permanently_excluded"]

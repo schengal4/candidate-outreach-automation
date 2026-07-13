@@ -16,13 +16,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
 from google_auth_oauthlib.flow import Flow
 
-from .config import (
-    ALLOWED_LOGIN_EMAILS,
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET,
-    GOOGLE_LOGIN_REDIRECT_URI,
-    LOGIN_SCOPES,
-)
+from . import config
 
 
 class LoginError(Exception):
@@ -30,13 +24,14 @@ class LoginError(Exception):
 
 
 def _client_config() -> dict:
+    s = config.settings
     return {
         "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
+            "client_id": s.GOOGLE_CLIENT_ID,
+            "client_secret": s.GOOGLE_CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_LOGIN_REDIRECT_URI],
+            "redirect_uris": [s.GOOGLE_LOGIN_REDIRECT_URI],
         }
     }
 
@@ -52,7 +47,9 @@ _pending_verifiers: Dict[str, str] = {}
 
 def build_login_url() -> str:
     flow = Flow.from_client_config(
-        _client_config(), scopes=LOGIN_SCOPES, redirect_uri=GOOGLE_LOGIN_REDIRECT_URI
+        _client_config(),
+        scopes=list(config.settings.LOGIN_SCOPES),
+        redirect_uri=config.settings.GOOGLE_LOGIN_REDIRECT_URI,
     )
     state = secrets.token_urlsafe(24)
     auth_url, _ = flow.authorization_url(state=state)
@@ -73,8 +70,8 @@ def handle_login_callback(code: str, state: str) -> dict:
         )
     flow = Flow.from_client_config(
         _client_config(),
-        scopes=LOGIN_SCOPES,
-        redirect_uri=GOOGLE_LOGIN_REDIRECT_URI,
+        scopes=list(config.settings.LOGIN_SCOPES),
+        redirect_uri=config.settings.GOOGLE_LOGIN_REDIRECT_URI,
         code_verifier=code_verifier,
     )
     flow.fetch_token(code=code)
@@ -85,12 +82,14 @@ def handle_login_callback(code: str, state: str) -> dict:
     # Signature/audience/expiry verification — don't trust the JWT contents
     # without it. Small clock-skew tolerance for local-machine clocks.
     claims = google_id_token.verify_oauth2_token(
-        raw_id_token, GoogleAuthRequest(), GOOGLE_CLIENT_ID, clock_skew_in_seconds=10
+        raw_id_token, GoogleAuthRequest(), config.settings.GOOGLE_CLIENT_ID,
+        clock_skew_in_seconds=10,
     )
 
     email = str(claims.get("email", "")).strip().lower()
     if not email or not claims.get("email_verified", False):
         raise LoginError("Google account has no verified email address.")
-    if ALLOWED_LOGIN_EMAILS and email not in ALLOWED_LOGIN_EMAILS:
+    allowed = config.settings.ALLOWED_LOGIN_EMAILS
+    if allowed and email not in allowed:
         raise LoginError(f"{email} is not authorized to use this app.")
     return {"email": email, "name": str(claims.get("name", "") or "")}

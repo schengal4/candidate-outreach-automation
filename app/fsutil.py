@@ -15,6 +15,9 @@ from pathlib import Path
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     path = Path(path)
+    # Lazy dir creation: config no longer mkdirs at import, so writers into
+    # data/ subdirectories create their parent on first use.
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:

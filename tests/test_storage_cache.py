@@ -1,60 +1,41 @@
-"""storage.py cache + lock: repeated reads don't re-parse, external file
-changes are picked up, saves are immediately visible, and concurrent saves
-don't lose updates. Uses throwaway candidate ids; real data untouched."""
-import json
+"""storage.py on SQLite: round-trips, immediate read-after-write, owner
+filtering (normalized case), and concurrent saves from threads don't lose
+updates. Uses throwaway candidate ids; real data untouched."""
 import sys
 import threading
-import time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 import app.storage as storage
 from app.models import Candidate
 
-# Count actual JSON parses by wrapping json.load as seen from storage.py
-parse_count = {"n": 0}
-_orig_load = storage.json.load
-
-
-def counting_load(f):
-    parse_count["n"] += 1
-    return _orig_load(f)
-
-
-storage.json = type(sys)("json_proxy")
-storage.json.load = counting_load
-storage.json.dump = json.dump
-storage.json.dumps = json.dumps  # used by the atomic-write save path
-
 TEMP_IDS = [f"cachetest{i}" for i in range(6)]
 
 
-def temp_candidate(cid, name):
+def temp_candidate(cid, name, owner="cache.test@example.com"):
     return Candidate(id=cid, name=name, email="", current_employer="X",
-                     resume_text="r", owner_email="cache.test@example.com")
+                     resume_text="r", owner_email=owner)
 
 
 try:
-    # 1. Repeated reads hit the cache (at most one parse)
-    storage._cache = None  # start cold
-    parse_count["n"] = 0
-    for _ in range(50):
-        storage.list_candidates()
-        storage.get_candidate("516e7c4751")
-    assert parse_count["n"] == 1, f"expected 1 parse for 100 reads, got {parse_count['n']}"
-    print("PASS: 100 consecutive reads = 1 JSON parse (cache hit)")
-
-    # 2. A save is immediately visible without stale reads
+    # 1. A save is immediately visible, and the full record round-trips
     storage.save_candidate(temp_candidate(TEMP_IDS[0], "Cache Test 0"))
-    assert storage.get_candidate(TEMP_IDS[0]).name == "Cache Test 0"
-    print("PASS: writes are immediately readable")
+    got = storage.get_candidate(TEMP_IDS[0])
+    assert got.name == "Cache Test 0" and got.owner_email == "cache.test@example.com"
+    print("PASS: writes are immediately readable and round-trip")
 
-    # 3. External modification (another process editing the file) is noticed
-    time.sleep(0.02)  # ensure mtime_ns advances even on coarse clocks
-    raw = json.loads(storage.CANDIDATES_FILE.read_text(encoding="utf-8"))
-    raw[TEMP_IDS[1]] = temp_candidate(TEMP_IDS[1], "External Edit").to_dict()
-    storage.CANDIDATES_FILE.write_text(json.dumps(raw), encoding="utf-8")
-    assert storage.get_candidate(TEMP_IDS[1]).name == "External Edit"
-    print("PASS: external file edits invalidate the cache")
+    # 2. Owner filtering matches case-insensitively (normalized column)
+    storage.save_candidate(temp_candidate(TEMP_IDS[1], "Mixed Case", owner="Cache.Test@Example.com"))
+    mine = storage.list_candidates(owner_email="cache.test@example.com")
+    assert {c.id for c in mine} >= {TEMP_IDS[0], TEMP_IDS[1]}, [c.id for c in mine]
+    assert storage.list_candidates(owner_email="nobody@example.com") == []
+    print("PASS: owner filtering is case-insensitive and scoped")
+
+    # 3. Updating an existing candidate replaces, not duplicates
+    updated = temp_candidate(TEMP_IDS[0], "Renamed")
+    storage.save_candidate(updated)
+    assert storage.get_candidate(TEMP_IDS[0]).name == "Renamed"
+    assert sum(1 for c in storage.list_candidates() if c.id == TEMP_IDS[0]) == 1
+    print("PASS: re-saving a candidate updates in place")
 
     # 4. Concurrent saves from threads don't drop each other (the old race)
     def save_from_thread(i):
