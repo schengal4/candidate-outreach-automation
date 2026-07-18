@@ -38,3 +38,17 @@ fixed = _ensure_greeting_and_closing("Great work on the launch.\n\nBest,", "Enha
 assert fixed.startswith("Hi Enhao,\n\nGreat work"), fixed[:40]
 assert fixed.count("Best,") == 1, "closing must not be duplicated"
 print("PASS: existing closing is not duplicated when only the greeting is added")
+
+# A question mangled into the closing-comma format (a real run shipped
+# "Would you be open to a short call sometime,") gets its question mark back
+# and a real closing after it.
+body = "Hi Sudhir,\n\nThe governance point matches what I saw.\n\nWould you be open to a short call sometime,"
+fixed = _ensure_greeting_and_closing(body, "Sudhir")
+assert fixed.endswith("Would you be open to a short call sometime?\n\nBest,"), fixed[-70:]
+print("PASS: a comma-mangled closing question is restored and closed properly")
+
+# Statement-style closings that happen to start with an interrogative word
+# ("Would love to talk,") are NOT questions — leave them alone.
+body = "Hi Ann,\n\nGood stuff.\n\nWould love to talk,"
+assert _ensure_greeting_and_closing(body, "Ann") == body
+print("PASS: 'Would love to talk,' style closings are left untouched")

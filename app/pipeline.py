@@ -8,10 +8,12 @@ Step 2  Contact identification, one at a time: find the best contact, try
 Step 3  Email lookup via Hunter (interleaved with step 2 -- see above)
 Step 4  Personalization research (+ optional red flag detection)
 Step 5  Draft generation (+ plain sign-off signature)
-Step 6  Draft fact-check: a fresh call grounds the draft's claims against the
-        research and spot-checks the most specific ones (plus the contact's
-        employment) on the web; only a clean/flagged draft reaches the Sent
-        List. A departed contact drops the company -- no replacement contact.
+Step 6  Draft fact-check: two parallel fresh calls that see only the
+        contact and the draft (never the research notes) — one independently
+        verifies every claim against live web sources, the other the
+        contact's employment and LinkedIn URL; only a clean/flagged draft
+        reaches the Sent List. A departed contact drops the company -- no
+        replacement contact.
 
 Steps 2-6 run sequentially within a company; companies run concurrently.
 
@@ -30,9 +32,10 @@ import time
 from collections import deque
 from typing import Dict, Iterable, List
 
-from . import config, run_store, sent_list, steps
+from . import config, llm, run_store, sent_list, steps
 from .draft_hygiene import SIGNATURE_SEP, email_signature
-from .llm import LLMError
+from .llm import LLMError, LLMTimeoutError
+from .logging_setup import run_id_var
 from .models import (
     Candidate,
     CompanyState,
@@ -46,6 +49,22 @@ from .models import (
 logger = logging.getLogger("app.pipeline")
 
 _LINKEDIN_SLUG_RE = re.compile(r"linkedin\.com/in/([^/?#]+)", re.IGNORECASE)
+
+# Drop reasons that mean the COMPANY is hard to reach (contacts can't be
+# found or verified) rather than the infrastructure hiccuping. Only these go
+# on the durable fail list that warns at future review gates — flagging LLM
+# timeouts, network blips, and parse errors would mark perfectly good
+# companies a retry would likely land, and teach the user to ignore the flag.
+_COMPANY_FAILURE_PREFIXES = (
+    "no contact identified",
+    "employment could not be verified",
+    "no valid email found",          # legacy reason in pre-manual-outreach run files
+    "contact no longer at company",
+)
+
+
+def _is_company_failure(reason: str) -> bool:
+    return bool(reason) and reason.startswith(_COMPANY_FAILURE_PREFIXES)
 
 
 def _linkedin_slug(url: str) -> str:
@@ -131,9 +150,10 @@ async def _run_company(
 ) -> None:
     """Steps 2 -> 6 sequentially for one company.
 
-    All companies in a run call this concurrently (no artificial concurrency
-    cap) -- rate-limit/overload responses from that burst are absorbed by the
-    retry-with-backoff in llm.py's _send_request, not handled here.
+    All companies in a run call this concurrently; the actual LLM requests
+    are throttled by llm.py's global in-flight cap (LLM_MAX_CONCURRENT_CALLS),
+    and whatever still hits a 429 is absorbed by the retry-with-backoff in
+    llm.py's _send_request, not handled here.
     """
 
     def report(text: str) -> None:
@@ -145,6 +165,13 @@ async def _run_company(
         if reason:
             company.drop_reason = reason
             logger.info("%s (%s): dropped — %s", company.name, company.domain, reason)
+            if _is_company_failure(reason):
+                # Durable fail list: survives run-report pruning, so the next
+                # review gate still warns about this company (transient
+                # errors deliberately stay off it — see the prefix list).
+                run_store.record_company_failure(
+                    candidate.id, company.domain, reason, time.time()
+                )
 
     try:
         set_status(CompanyStatus.CONTACTS)
@@ -179,29 +206,43 @@ async def _run_company(
             # spend a second call looking for a backup contact.
             set_status(CompanyStatus.CONTACTS)
             excluded = recently_contacted_names + [company.primary.full_name]
-            company.backup = await steps.identify_contact(
-                candidate,
-                company.name,
-                company.domain,
-                excluded,
-                on_progress=report,
-                label=f"backup:{company.name}",
-            )
+            try:
+                company.backup = await steps.identify_contact(
+                    candidate,
+                    company.name,
+                    company.domain,
+                    excluded,
+                    on_progress=report,
+                    label=f"backup:{company.name}",
+                )
+            except LLMTimeoutError:
+                if not company.primary.employment_verified:
+                    raise  # nothing to fall back to — drops with the timeout reason
+                # The backup search (its retry included) timed out, but the
+                # primary is already verified — a real run dropped a company
+                # here over a search for a contact it didn't need. Fall
+                # through to the manual-outreach path below.
+                logger.warning(
+                    "backup:%s: timed out — falling back to the verified primary contact",
+                    company.name,
+                )
+                company.backup = None
 
-            if not (company.backup and company.backup.employment_verified):
+            if company.backup and company.backup.employment_verified:
+                set_status(CompanyStatus.EMAIL)
+                email, score, hunter_linkedin = await steps.lookup_email(
+                    company.domain, company.backup, blocked_emails
+                )
+                if email:
+                    company.contact_used, company.email, company.email_score = (
+                        company.backup, email, score,
+                    )
+                    _apply_hunter_linkedin(company.backup, hunter_linkedin)
+                    found_email = True
+            elif not company.primary.employment_verified:
+                # Neither contact is verified — nothing safe to draft against.
                 set_status(CompanyStatus.DROPPED, "employment could not be verified for any contact")
                 return
-
-            set_status(CompanyStatus.EMAIL)
-            email, score, hunter_linkedin = await steps.lookup_email(
-                company.domain, company.backup, blocked_emails
-            )
-            if email:
-                company.contact_used, company.email, company.email_score = (
-                    company.backup, email, score,
-                )
-                _apply_hunter_linkedin(company.backup, hunter_linkedin)
-                found_email = True
 
         if not found_email:
             # No Hunter email, but we still have a verified contact — the
@@ -229,6 +270,9 @@ async def _run_company(
         company.research_summary = research.summary
         company.research_items = research.items
         company.red_flags = research.red_flags
+        # Failed research passes (empty on a clean run). The draft still
+        # proceeds — the report flags the missing personalization instead.
+        company.research_failures = research.failures
 
         set_status(CompanyStatus.DRAFTING)
         draft = await steps.draft_email(
@@ -241,7 +285,7 @@ async def _run_company(
 
         set_status(CompanyStatus.VERIFYING)
         verdict = await steps.verify_draft(
-            company.contact_used, company.name, company.domain, research,
+            company.contact_used, company.name, company.domain,
             company.draft_subject, company.draft_body, on_progress=report,
         )
         company.draft_verify_error = verdict.error
@@ -265,21 +309,43 @@ async def _run_company(
         _apply_verify_contact_updates(company.contact_used, verdict)
 
         if company.draft_flagged_claims:
-            # Fix flagged claims instead of only flagging them: one revision,
-            # rechecked without web, adopted only if cleaner. Whatever flags
-            # remain still reach the run report.
-            revision = await steps.revise_flagged_draft(
-                candidate, company.contact_used, company.name, research,
-                company.draft_subject,
-                company.draft_body.split(SIGNATURE_SEP)[0],
-                company.draft_flagged_claims,
-                on_progress=report,
-            )
-            if revision:
-                company.draft_subject = revision.subject
-                company.draft_body = revision.body + email_signature(candidate)
-                company.draft_flagged_claims = revision.flagged_claims
-                company.draft_banned_phrases = revision.banned_phrases
+            # Fix flagged claims instead of only flagging them. Round 1: one
+            # revision that softens each flagged claim to what its flag note
+            # leaves standing, rechecked with its own web budget (same
+            # independent standard as the fact-check), adopted only if no
+            # worse. Round 2 (removal mode — cut the claims entirely instead
+            # of softening) runs when EITHER 'unsupported' flags survive
+            # round 1 (contradicted claims, a substantial failure) OR round 1
+            # produced no adoptable revision at all (rechecked worse, or the
+            # call failed) — softening already had its chance either way. A
+            # real run shipped a flagged false attribution because a rejected
+            # round 1 used to end the process for 'unverified' flags. Never
+            # more than two rounds; whatever flags remain still reach the run
+            # report as warnings.
+            round1_rejected = False
+            for remove_entirely in (False, True):
+                if remove_entirely and not (
+                    round1_rejected
+                    or steps.substantial_flags(company.draft_flagged_claims)
+                ):
+                    break
+                revision = await steps.revise_flagged_draft(
+                    candidate, company.contact_used, company.name, research,
+                    company.draft_subject,
+                    company.draft_body.split(SIGNATURE_SEP)[0],
+                    company.draft_flagged_claims,
+                    remove_entirely=remove_entirely,
+                    on_progress=report,
+                )
+                if not remove_entirely:
+                    round1_rejected = revision is None
+                if revision:
+                    company.draft_subject = revision.subject
+                    company.draft_body = revision.body + email_signature(candidate)
+                    company.draft_flagged_claims = revision.flagged_claims
+                    company.draft_banned_phrases = revision.banned_phrases
+                if not company.draft_flagged_claims:
+                    break
 
         # Auto-add to Sent List once the draft passes the fact-check
         # (date_sent = today).
@@ -289,6 +355,10 @@ async def _run_company(
             company.contact_used.full_name,
             company.email,
         )
+        # A successful draft supersedes any recorded failure — without this,
+        # a company that once had an unverifiable contact would keep warning
+        # at review gates forever.
+        run_store.clear_company_failure(candidate.id, company.domain)
         set_status(CompanyStatus.DONE)
         logger.info(
             "%s (%s): draft complete (contact: %s)",
@@ -314,6 +384,12 @@ async def run_discovery(
     `previous_runs` — this candidate's other runs (the RunManager passes
     them), used to flag companies that already failed in an earlier run.
     """
+    # Both stamps ride the task context into everything spawned below: every
+    # log line gains [run_id] (see logging_setup) and every LLM response's
+    # usage lands in this run's rollup (see llm.usage_acc_var).
+    run_id_var.set(run.id)
+    usage = llm.new_usage_accumulator()
+    llm.usage_acc_var.set(usage)
 
     def report(text: str) -> None:
         run.activity = text
@@ -347,30 +423,34 @@ async def run_discovery(
             run.phase = RunPhase.ERROR
             run.error = "Discovery returned no companies."
             return
-        # Flag companies that failed in a previous run (dropped for a real,
-        # company-specific reason — not a run-level stop/timeout cutoff). The
-        # review gate shows the reason and leaves them UNCHECKED, so retrying
-        # a known failure is the user's explicit choice instead of a silent
-        # repeat: logged runs re-attempted the same unverifiable companies
-        # run after run. Derived from persisted run history — no separate
-        # store to maintain.
+        # Flag companies that failed in a previous run for a COMPANY-SPECIFIC
+        # reason (contacts couldn't be found/verified). The review gate shows
+        # the reason and leaves them UNCHECKED, so retrying a known failure
+        # is the user's explicit choice instead of a silent repeat. Transient
+        # drops (LLM timeouts, parse errors, network blips, run cutoffs) are
+        # deliberately NOT flagged — a retry usually just works, and warning
+        # about them teaches the user to ignore the flag.
         past_failures: Dict[str, str] = {}
         for past in sorted(
             (r for r in previous_runs if r.candidate_id == candidate.id and r.id != run.id),
             key=lambda r: r.created_at,  # ascending, so the latest reason wins
         ):
             for comp in past.companies:
-                if (
-                    comp.status == CompanyStatus.DROPPED
-                    and comp.drop_reason
-                    and not comp.drop_reason.startswith("run stopped early")
-                ):
+                if comp.status == CompanyStatus.DROPPED and _is_company_failure(comp.drop_reason):
                     past_failures[comp.domain] = comp.drop_reason
+        # The durable fail list (written at drop time) outlives run-report
+        # pruning: real data showed companies that failed 6+ runs back
+        # resurfacing unflagged because KEEP_RUNS_PER_CANDIDATE had pruned
+        # the runs that recorded the failure.
+        past_failures.update(run_store.company_failures(candidate.id))
         for c in run.discovered:
             if c["domain"] in past_failures:
                 c["failed_before"] = past_failures[c["domain"]]
 
-        logger.info("Run %s: discovery found %d companies — awaiting review", run.id, len(run.discovered))
+        logger.info(
+            "Run %s: discovery found %d companies — awaiting review (%s)",
+            run.id, len(run.discovered), llm.format_usage(usage),
+        )
         run.phase = RunPhase.REVIEW
     except Exception as exc:
         logger.exception("Run %s: discovery failed", run.id)
@@ -391,6 +471,12 @@ async def run_pipeline(run: RunState, candidate: Candidate, approved_domains: Li
     happens first. A single web-search-heavy company can otherwise take much
     longer than a user wants to wait on the whole run.
     """
+    # Same two stamps as run_discovery (this coroutine runs as its OWN task,
+    # so the discovery task's context does not carry over): [run_id] on every
+    # log line below, and a fresh usage rollup for the closing lines.
+    run_id_var.set(run.id)
+    usage = llm.new_usage_accumulator()
+    llm.usage_acc_var.set(usage)
     try:
         approved = [c for c in run.discovered if c["domain"] in set(approved_domains)]
         run.companies = [
@@ -491,11 +577,26 @@ async def run_pipeline(run: RunState, candidate: Candidate, approved_domains: Li
         run.companies = [c for c in run.companies if c.status != CompanyStatus.PENDING]
         run.phase = RunPhase.DONE
         logger.info(
-            "Run %s: finished — %d drafted, %d dropped",
+            "Run %s: finished — %d drafted, %d dropped, took=%.0fs %s",
             run.id,
             sum(1 for c in run.companies if c.status == CompanyStatus.DONE),
             sum(1 for c in run.companies if c.status == CompanyStatus.DROPPED),
+            time.time() - (run.started_running_at or run.created_at),
+            llm.format_usage(usage),
         )
+        if usage["by_step"]:
+            # Which step ate the budget — the question the totals line can't
+            # answer. One line, not one per step, so a grep for the run id
+            # stays readable.
+            logger.info(
+                "Run %s: usage by step — %s",
+                run.id,
+                "; ".join(
+                    f"{step}: calls={v['calls']} searches={v['searches']} "
+                    f"input={v['input']} output={v['output']}"
+                    for step, v in sorted(usage["by_step"].items())
+                ),
+            )
     except Exception as exc:
         logger.exception("Run %s: pipeline failed", run.id)
         run.phase = RunPhase.ERROR

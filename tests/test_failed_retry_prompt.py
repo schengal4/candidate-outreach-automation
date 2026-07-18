@@ -1,5 +1,8 @@
 """Previously-failed companies resurface at the review gate flagged with the
-failure reason and unchecked, so retrying is an explicit user choice.
+failure reason and unchecked, so retrying is an explicit user choice. Only
+COMPANY-SPECIFIC failures count (contacts couldn't be found/verified) —
+transient drops (LLM timeouts, parse errors, run cutoffs) are not flagged,
+since a retry usually just works.
 Runs in open mode (REQUIRE_LOGIN=0) — renders the review panel via the route."""
 import asyncio
 import re
@@ -18,14 +21,17 @@ cand = Candidate(
     id="testfail001", name="T", email="", current_employer="X", resume_text="r",
 )
 
-# A past run: one company failed for a real reason, one was only cut off by
-# the stop button (not the company's fault — must not be held against it).
+# A past run: one company failed for a real company-specific reason, one was
+# only cut off by the stop button, and one dropped on a transient LLM error —
+# only the first is the company's fault and may be held against it.
 past = RunState(id="testfailpast1", candidate_id=cand.id, phase=RunPhase.DONE)
 bad = CompanyState(name="BadCo", domain="badco.com", status=CompanyStatus.DROPPED)
 bad.drop_reason = "employment could not be verified for any contact"
 cut = CompanyState(name="CutCo", domain="cutco.com", status=CompanyStatus.DROPPED)
 cut.drop_reason = "run stopped early (stopped by user)"
-past.companies = [bad, cut]
+err = CompanyState(name="ErrCo", domain="errco.com", status=CompanyStatus.DROPPED)
+err.drop_reason = "error: LLM call timed out after 8 minutes (research:ErrCo)."
+past.companies = [bad, cut, err]
 RUNS[past.id] = past
 
 run = RunState(id="testfailrun1", candidate_id=cand.id)
@@ -36,6 +42,7 @@ async def fake_discover(candidate, count, on_progress=None, excluded_domains=Non
     return [
         {"name": "BadCo", "domain": "badco.com", "reason": "fit"},
         {"name": "CutCo", "domain": "cutco.com", "reason": "fit"},
+        {"name": "ErrCo", "domain": "errco.com", "reason": "fit"},
         {"name": "NewCo", "domain": "newco.com", "reason": "fit"},
     ]
 
@@ -50,8 +57,9 @@ try:
     by_domain = {c["domain"]: c for c in run.discovered}
     assert by_domain["badco.com"]["failed_before"] == "employment could not be verified for any contact"
     assert "failed_before" not in by_domain["cutco.com"]
+    assert "failed_before" not in by_domain["errco.com"], "transient LLM errors must not flag"
     assert "failed_before" not in by_domain["newco.com"]
-    print("PASS: real past failures annotated; stop-early and new companies aren't")
+    print("PASS: contact failures annotated; stop-early, transient-error, and new companies aren't")
 finally:
     steps.discover_companies = real_discover
     for rid in (past.id, run.id):

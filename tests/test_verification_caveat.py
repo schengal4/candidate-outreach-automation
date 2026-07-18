@@ -45,6 +45,41 @@ try:
 finally:
     RUNS.pop(run.id, None)
 
+# 3b. Employment-doubt classification: departure signals are priority,
+#     routine confirm-the-title nudges are not
+from app.models import employment_doubt
+
+assert employment_doubt("a newer profile suggests they may have left the company")
+assert employment_doubt("the fact-check found an updated role/title: CTO")
+assert employment_doubt("company was acquired in May; leadership routinely departs")
+assert not employment_doubt(CAVEAT)  # confirm-still-CEO nudge stays routine
+assert not employment_doubt("Title sourced from an org-chart aggregator; confirm precise title")
+assert not employment_doubt("")
+print("PASS: employment_doubt separates departure signals from routine nudges")
+
+# 3c. An employment-doubt caveat renders in the red priority tier, and the
+#     report leads with the priority digest
+run3 = RunState(id="testcaveat003", candidate_id="516e7c4751", phase=RunPhase.DONE)
+doubt = CompanyState(name="GoneCo", domain="gone.com", status=CompanyStatus.DONE)
+doubt.contact_used = Contact(
+    first_name="Steve", last_name="B", title="CTO", employment_verified=True,
+    verification_caveat="a newer LinkedIn profile suggests they may have left the company",
+)
+doubt.email = "s@gone.com"
+doubt.draft_subject = "s"
+doubt.draft_body = "Hi Steve,\n\nbody\n\nThanks,"
+run3.companies = [doubt]
+RUNS[run3.id] = run3
+try:
+    html = TestClient(fastapi_app).get(f"/runs/{run3.id}/panel").text
+    assert "Serious question about this contact" in html
+    assert "flag priority" in html
+    assert "need attention before sending" in html
+    assert "employment in question" in html
+    print("PASS: employment-doubt caveat renders red, with the digest up top")
+finally:
+    RUNS.pop(run3.id, None)
+
 # 4. Salvaged (dropped-with-contact) company shows the caveat inline
 run2 = RunState(id="testcaveat002", candidate_id="516e7c4751", phase=RunPhase.DONE)
 dropped = CompanyState(name="StaleCo", domain="stale.com", status=CompanyStatus.DROPPED)

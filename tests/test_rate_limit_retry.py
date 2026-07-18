@@ -17,6 +17,17 @@ def make_rate_limit_error(retry_after=None):
     return anthropic.RateLimitError("rate limited", response=response, body={"error": {"type": "rate_limit_error"}})
 
 
+def make_midstream_error(error_type):
+    """What the SDK raises for an SSE `error` event mid-stream: the HTTP
+    handshake already returned 200, so _make_status_error falls through every
+    status-mapped class to bare APIStatusError — the real type is only in the
+    body. A real run died on exactly this shape (overloaded_error)."""
+    body = {"type": "error", "error": {"details": None, "type": error_type, "message": error_type}}
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(200, request=request)
+    return anthropic.APIStatusError(str(body), response=response, body=body)
+
+
 class FakeStreamCM:
     """Mimics `async with client.messages.stream(**kwargs) as stream:` for one attempt."""
     def __init__(self, outcome):
@@ -101,6 +112,34 @@ async def test_non_retryable_propagates_immediately():
     print("PASS: a non-rate-limit error (400) is not retried")
 
 
+async def test_midstream_overload_is_retried():
+    llm.RATE_LIMIT_BASE_DELAY_SECONDS = 0.01
+    llm.RATE_LIMIT_MAX_DELAY_SECONDS = 0.02
+    final_message = object()
+    client = FakeClient([
+        make_midstream_error("overloaded_error"),
+        make_midstream_error("api_error"),
+        final_message,
+    ])
+    msg = await llm._send_request(client, {}, lambda t: None)
+    assert msg is final_message
+    assert client.messages.calls == 3, client.messages.calls
+    print("PASS: mid-stream overloaded_error/api_error (bare APIStatusError) is retried")
+
+
+async def test_midstream_non_transient_propagates():
+    client = FakeClient([make_midstream_error("invalid_request_error")])
+    try:
+        await llm._send_request(client, {}, lambda t: None)
+        assert False, "expected APIStatusError to propagate"
+    except anthropic.APIStatusError as exc:
+        assert "invalid_request_error" in str(exc)
+    assert client.messages.calls == 1, client.messages.calls
+    print("PASS: a mid-stream non-transient error type is not retried")
+
+
 asyncio.run(test_retries_then_succeeds())
 asyncio.run(test_gives_up_after_max_retries())
 asyncio.run(test_non_retryable_propagates_immediately())
+asyncio.run(test_midstream_overload_is_retried())
+asyncio.run(test_midstream_non_transient_propagates())

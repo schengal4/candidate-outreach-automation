@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Run — Candidate Outreach{% endblock %}
 {% block content %}
+<p class="muted"><a href="/candidates/{{ c.id }}">‹ Back to {{ c.name }}'s profile</a></p>
 <h2>Outreach run for {{ c.name }}</h2>
 <p class="muted">Elapsed: <span id="elapsed">{{ elapsed }}s</span></p>
 <div id="panel" hx-get="/runs/{{ run.id }}/panel" hx-trigger="load, every 3s" hx-swap="innerHTML">

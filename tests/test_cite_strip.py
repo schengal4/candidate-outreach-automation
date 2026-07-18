@@ -13,6 +13,11 @@ from app.models import Contact
 
 
 async def fake_ask_json(system, user, **kw):
+    # Research now runs as two parallel passes (person / company-news) —
+    # return the cite-laden payload from the person pass only, so the
+    # assertions below stay exact.
+    if kw.get("label", "").startswith("research-co:"):
+        return {"summary": "", "items": [], "red_flags": []}
     return {
         "summary": 'He said <cite index="4-1">a technology company</cite> at launch.',
         "items": [

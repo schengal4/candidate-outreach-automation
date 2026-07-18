@@ -113,6 +113,27 @@
 <p class="muted">All drafts below were added to the <a href="/sent/{{ c.id }}">Sent List</a>.
    Next time you open the app you'll be asked to confirm which ones you actually sent.</p>
 
+{# Priority digest: the few must-look problems, up front — real runs stacked
+   so many equal-weight warnings that they all got skimmed past. #}
+{% set ns = namespace(attention=[]) %}
+{% for comp in run.companies %}
+  {% if comp.status == "done" and comp.priority_flags() %}
+    {% set ns.attention = ns.attention + [comp] %}
+  {% endif %}
+{% endfor %}
+{% if ns.attention %}
+<article class="flag priority">
+  <strong>⚠ {{ ns.attention | length }} of {{ s.drafts }} drafts need attention before sending:</strong>
+  <ul>
+    {% for comp in ns.attention %}
+    <li><strong>{{ comp.name }}</strong> — {{ comp.priority_flags() | join("; ") }}</li>
+    {% endfor %}
+  </ul>
+  <span class="muted">Details are on each draft below, in red. Amber notes are routine
+  double-checks; muted notes are wording only.</span>
+</article>
+{% endif %}
+
 {% for comp in run.companies %}
 {% if comp.status == "done" %}
 <article>
@@ -129,8 +150,15 @@
   </header>
 
   {% if comp.contact_used.verification_caveat %}
-  <div class="flag">
+  {# Employment doubts (departure signals, conflicting profiles, newer
+     titles) are the costliest mistake an outreach email can make — they
+     render red; routine confirm-the-title nudges stay amber. #}
+  <div class="flag{% if comp.contact_employment_doubt() %} priority{% endif %}">
+    {% if comp.contact_employment_doubt() %}
+    <strong>⚠ Serious question about this contact's employment — check before sending.</strong>
+    {% else %}
     <strong>⚠ Verify this contact before sending.</strong>
+    {% endif %}
     {{ comp.contact_used.verification_caveat }}
     {{ linkedin_link(comp.contact_used, comp.name,
                      "Open LinkedIn to check their current role.",
@@ -139,41 +167,59 @@
   {% endif %}
 
   {% if comp.red_flags %}
-  <div class="flag">
+  <div class="flag priority">
     <strong>⚠ Red flags found — review before sending. Your call.</strong>
     <ul>{% for f in comp.red_flags %}<li>{{ f }}</li>{% endfor %}</ul>
   </div>
   {% endif %}
 
-  {% if comp.draft_banned_phrases %}
-  <div class="flag">
-    <strong>⚠ Review the wording before sending.</strong>
-    This draft still uses phrasing the style rules try to avoid
-    ({{ comp.draft_banned_phrases | join(", ") }}). A quick manual edit is worth it.
+  {% if comp.unsupported_claims() %}
+  <div class="flag priority">
+    <strong>⚠ These claims failed the fact-check — fix before sending.</strong>
+    The checker found them contradicted by live sources, or more specific
+    than any source actually says:
+    <ul>{% for cl in comp.unsupported_claims() %}<li>{{ cl }}</li>{% endfor %}</ul>
   </div>
   {% endif %}
 
-  {% if comp.draft_flagged_claims %}
+  {% if comp.unverified_claims() %}
   <div class="flag">
     <strong>⚠ Check these claims before sending.</strong>
-    A fact-check pass could not ground everything this draft asserts — verify
-    (or soften) these, they may overstate what the sources actually say:
-    <ul>{% for cl in comp.draft_flagged_claims %}<li>{{ cl }}</li>{% endfor %}</ul>
+    The fact-check couldn't confirm these either way within its search
+    budget — they may be fine, but verify (or soften) them:
+    <ul>{% for cl in comp.unverified_claims() %}<li>{{ cl }}</li>{% endfor %}</ul>
   </div>
   {% endif %}
 
   {% if comp.draft_verify_error %}
-  <div class="flag">
+  <div class="flag priority">
     <strong>⚠ This draft was not fact-checked.</strong>
     The fact-check step failed ({{ comp.draft_verify_error }}) — double-check
     the contact's role and any product or company claims yourself before sending.
   </div>
   {% endif %}
 
+  {% if comp.research_failures and not comp.research_items %}
+  {# Only a TOTAL research failure gets a banner — a draft with no personal
+     hook at all is worth attention. Partial failures (some findings
+     survived) are routine and live in the collapsed details below; wording
+     nits (banned phrases) are deliberately not rendered at all — both
+     buried the factual flags users must act on. #}
+  <div class="flag priority">
+    <strong>⚠ Personalization research failed — this draft is generic.</strong>
+    The email was written from the contact's name, title, and company alone
+    (nothing was invented to fill the gap). Add a personal hook yourself, or
+    send it knowing it reads general.
+  </div>
+  {% endif %}
+
   <details>
     <summary>Employment evidence &amp; research</summary>
     <p><strong>Evidence:</strong> {{ comp.contact_used.evidence }}</p>
-    <p><strong>Research:</strong> {{ comp.research_summary }}</p>
+    <p><strong>Research:</strong> {{ comp.research_summary or ("(no research notes were gathered)" if comp.research_failures else "") }}</p>
+    {% if comp.research_failures %}
+    <p class="muted">Research passes that failed: {{ comp.research_failures | join("; ") }}</p>
+    {% endif %}
     {% if comp.research_items %}
     <ul>{% for item in comp.research_items %}
       {# Structured items carry provenance; run files from before the

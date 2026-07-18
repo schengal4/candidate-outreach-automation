@@ -10,6 +10,11 @@
     .drop { color: var(--pico-del-color); }
     .ok { color: var(--pico-ins-color); }
     .flag { background: #fff3cd; border-left: 4px solid #d97706; padding: .5rem .75rem; margin: .5rem 0; }
+    /* Priority tier: employment doubts, contradicted claims, unchecked
+       drafts. Red so it reads as "stop", distinct from the amber
+       routine-check tier — equal-weight warnings got tuned out. */
+    .flag.priority { background: #fdecea; border-left-color: #b91c1c; }
+    .flag.priority > strong { color: #b91c1c; }
     pre.email { white-space: pre-wrap; background: var(--pico-card-background-color); padding: 1rem; border-radius: .5rem; }
     .muted { color: var(--pico-muted-color); font-size: .9em; }
     td form { margin: 0; display: inline; }

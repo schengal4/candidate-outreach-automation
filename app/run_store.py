@@ -123,3 +123,37 @@ def delete_candidate_runs(candidate_id: str, runs: Dict[str, RunState]) -> None:
         delete_run(run_id)
     db.execute("DELETE FROM runs WHERE candidate_id = ?", (candidate_id,))
     db.execute("DELETE FROM run_ledger WHERE candidate_id = ?", (candidate_id,))
+    db.execute("DELETE FROM company_failures WHERE candidate_id = ?", (candidate_id,))
+
+
+# ------------------------------------------------------------------ #
+# Durable company-failure memory (drives the review gate's "failed last
+# time" flag). Written by the pipeline when a company drops for a
+# company-specific reason, cleared when a later run drafts it successfully.
+# Kept separately from run reports so KEEP_RUNS_PER_CANDIDATE pruning can't
+# erase the memory of a company that's genuinely hard to reach.
+# ------------------------------------------------------------------ #
+def record_company_failure(candidate_id: str, domain: str, reason: str, when: float) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO company_failures"
+        " (candidate_id, domain, reason, last_failed_at) VALUES (?, ?, ?, ?)",
+        (candidate_id, domain, reason, when),
+    )
+
+
+def clear_company_failure(candidate_id: str, domain: str) -> None:
+    db.execute(
+        "DELETE FROM company_failures WHERE candidate_id = ? AND domain = ?",
+        (candidate_id, domain),
+    )
+
+
+def company_failures(candidate_id: str) -> Dict[str, str]:
+    """domain -> most recent company-specific failure reason."""
+    return {
+        r["domain"]: r["reason"]
+        for r in db.query(
+            "SELECT domain, reason FROM company_failures WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+    }

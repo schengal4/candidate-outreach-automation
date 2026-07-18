@@ -39,7 +39,7 @@ class FakeTextBlock:
 async def test_cache_prefix_shapes_the_request():
     captured_kwargs = []
 
-    async def fake_send_request(client, kwargs, report):
+    async def fake_send_request(client, kwargs, report, label=""):
         captured_kwargs.append(kwargs)
         return FakeMessage("end_turn", [FakeTextBlock('{"ok": true}')])
 
@@ -69,7 +69,7 @@ async def test_cache_prefix_shapes_the_request():
 async def test_no_cache_prefix_falls_back_to_plain_string():
     captured_kwargs = []
 
-    async def fake_send_request(client, kwargs, report):
+    async def fake_send_request(client, kwargs, report, label=""):
         captured_kwargs.append(kwargs)
         return FakeMessage("end_turn", [FakeTextBlock('{"ok": true}')])
 
@@ -84,7 +84,7 @@ async def test_pause_turn_continuation_resends_structured_content_and_container(
     captured_kwargs = []
     calls = {"n": 0}
 
-    async def fake_send_request(client, kwargs, report):
+    async def fake_send_request(client, kwargs, report, label=""):
         captured_kwargs.append(kwargs)
         calls["n"] += 1
         if calls["n"] == 1:

@@ -40,7 +40,7 @@ class Settings:
     # ERROR. LOG_DIR is overridable so the test runner can keep test noise
     # out of the real log file (it is a field, not derived from DATA_DIR,
     # for exactly that reason).
-    LOG_LEVEL: str = "INFO"
+    LOG_LEVEL: str = "DEBUG"
     LOG_DIR: Path = BASE_DIR / "data" / "logs"
 
     # ---- LLM ----
@@ -68,21 +68,66 @@ class Settings:
     # smaller search budget instead of dropping the company — by then the
     # contact is verified and the email found, the two expensive wins.
     RESEARCH_TIMEOUT_RETRY_MAX_USES: int = 3
-    # Draft verification (step 6) fact-checks each finished draft with a
-    # fresh call: every specific claim is grounded against the research
-    # notes, and the small search budget goes to the contact-employment
-    # re-check, one search confirming the contact's LinkedIn URL, plus the one
-    # or two most specific product claims. Deliberately the tightest leash of
-    # any web step — it spot-checks, it must not become a second research pass.
-    VERIFY_WEB_SEARCH_MAX_USES: int = 5
-    # 8 (not 5) minutes since the step gained the LinkedIn URL search and the
-    # currency checks — still the tightest-budgeted web step per search.
-    VERIFY_CALL_TIMEOUT_SECONDS: int = 8 * 60
+    # ...and on a tighter clock. A 3-search retry that hasn't finished in 4
+    # minutes is wandering (or stuck behind rate-limit backoff) and isn't
+    # going to finish — a real run's two research retries each rode the full
+    # 8-minute ceiling before dropping anyway, and one of them set the whole
+    # run's wall-clock.
+    RESEARCH_TIMEOUT_RETRY_TIMEOUT_SECONDS: int = 4 * 60
+    # Contact identification gets the same timeout salvage as research: one
+    # retry on a smaller budget and a tighter clock. A real run dropped a
+    # company whose PRIMARY contact was already found and verified because
+    # the BACKUP contact search timed out with no second chance.
+    CONTACT_TIMEOUT_RETRY_MAX_USES: int = 3
+    CONTACT_TIMEOUT_RETRY_TIMEOUT_SECONDS: int = 4 * 60
+    # Draft verification (step 6) fact-checks each finished draft with fresh
+    # calls that see ONLY the contact and the draft (never the research
+    # notes — they're LLM output themselves, and grounding against them is
+    # circular) and verify every specific claim independently against live
+    # sources. It runs as TWO PARALLEL passes (see steps.verify_draft):
+    # searches inside one streamed request run serially (each is a
+    # think+read round), so one 12-search call was the longest serial link
+    # in every company's chain — the same reason research was split. The
+    # split keeps the combined budget at 12, so no verification depth is
+    # lost; each pass has a dedicated job so the split can't silently thin
+    # coverage of either. Deliberately the most generous combined budget of
+    # any web step: a wrong claim in a sent email is the worst failure this
+    # product can ship, and the extra searches cost cents. Not uncapped,
+    # though — a truly unlimited search loop just rides into the
+    # pause_turn/timeout limits and comes back as a FAILED check, which
+    # protects nothing. Whatever the budget can't reach is flagged
+    # "unverified" rather than assumed correct.
+    # Pass 1: contact employment + LinkedIn URL ownership.
+    VERIFY_CONTACT_WEB_SEARCH_MAX_USES: int = 4
+    # Pass 2: every factual claim in the draft body.
+    VERIFY_CLAIMS_WEB_SEARCH_MAX_USES: int = 8
+    # Claims-only web recheck of a revised draft (steps.revise_flagged_draft):
+    # no contact/LinkedIn re-check, so a smaller budget covers it.
+    RECHECK_WEB_SEARCH_MAX_USES: int = 6
+    # The removal-mode revision round only: a few searches so it can REPLACE
+    # a false claim with one it just verified instead of only cutting it
+    # (cutting is how a draft loses its hook). Round-1 revisions stay
+    # no-web — the flag notes and research items already carry the truth
+    # there, and the recheck above independently gates whatever this round
+    # writes either way.
+    REVISE_WEB_SEARCH_MAX_USES: int = 3
+    # 15 minutes (the global per-call ceiling): independent verification of
+    # every claim runs more searches than the old spot-check did, and each
+    # search is a think+read round.
+    VERIFY_CALL_TIMEOUT_SECONDS: int = 15 * 60
     LLM_MAX_TOKENS: int = 16000
     # Each continuation resends the whole growing conversation so far as
     # input tokens, so keep this low — 2 means at most 3 requests per
     # ask_json() call.
     MAX_PAUSE_TURN_CONTINUATIONS: int = 2
+    # No-progress watchdog for a single streamed request: abandon the call
+    # when the stream delivers NO events for this long. Even mid-search the
+    # stream stays chatty (thinking deltas, block starts, tool results land
+    # within seconds of each other), so a 2-minute silence means the request
+    # is wedged — better to fail fast into the step's timeout salvage
+    # (smaller-budget retry) than ride the full wall-clock ceiling below:
+    # a real run burned 2x480s on one company's stalled research calls.
+    LLM_STALL_TIMEOUT_SECONDS: int = 120
     # Safety valve for a single LLM call. Web-search-heavy contact searches
     # have run 20+ minutes as ONE streaming request on hard-to-verify
     # companies (the stream keeps delivering thinking, so no HTTP timeout
@@ -90,6 +135,53 @@ class Settings:
     # a clear reason instead of squatting until the run-wide timeout kills
     # everything. Applies per request, including its rate-limit retries.
     LLM_CALL_TIMEOUT_SECONDS: int = 15 * 60
+
+    # Connection-outage salvage. An APIConnectionError means the request
+    # never reached the API (or lost it mid-flight) — in a real run that was
+    # a local network/DNS outage ("getaddrinfo failed"), and it dropped FIVE
+    # companies in four seconds as "unexpected error", all with verified
+    # contacts already paid for. Instead of failing the call on the first
+    # connection error, ask_json waits for connectivity to come back
+    # (probing DNS every CONNECTION_PROBE_INTERVAL_SECONDS, for up to
+    # CONNECTION_WAIT_SECONDS per outage — this wait does NOT count against
+    # the call's timeout) and retries the request, up to
+    # CONNECTION_ERROR_MAX_RETRIES times per call. Only when the network
+    # stays down longer than the wait window does the call fail, with a
+    # clear "check your connection" reason instead of a raw traceback.
+    CONNECTION_ERROR_MAX_RETRIES: int = 3
+    CONNECTION_WAIT_SECONDS: int = 120
+    CONNECTION_PROBE_INTERVAL_SECONDS: int = 5
+
+    # Global cap on in-flight LLM requests across the whole run. Companies
+    # still run their step chains concurrently, but only this many streamed
+    # requests execute at once — the rest queue (queue time does NOT count
+    # against the call's timeout). Rationale for capping: a mid-stream 429
+    # throws away the whole partial generation and restarts the call,
+    # backoff burns the per-call clock, and logged runs showed late-run
+    # calls starved into their 8-minute timeouts (one 3-search retry took
+    # 414s). Currently 30 — effectively UNCAPPED (a run tops out around
+    # max_companies concurrent chains, ~10). Search-enabled calls are
+    # additionally throttled by LLM_MAX_CONCURRENT_SEARCH_CALLS below,
+    # which is the cap that actually binds in practice.
+    LLM_MAX_CONCURRENT_CALLS: int = 30
+
+    # Separate, tighter cap on in-flight calls that USE WEB SEARCH (contact
+    # identification, research, discovery, fact-check). Web search has its
+    # own org-level searches-per-minute rate limit at Anthropic, and its
+    # failures arrive IN-BAND (an error object inside a 200 response — see
+    # llm._web_search_error_code), so the HTTP-429 backoff never absorbs
+    # them. A real run with ~15-20 concurrent search-enabled calls had
+    # nearly every research pass starved by "server tool use limit
+    # exceeded" errors: models burned minutes retrying, and several drafts
+    # were written from one research pass instead of two — a quality loss,
+    # not just a speed one. Capping concurrency keeps the run inside the
+    # per-minute search budget: queued calls start later but their searches
+    # SUCCEED (queue time doesn't count against the call timeout), a net
+    # win for both accuracy and wall-clock. Cheap non-search calls
+    # (drafting, revisions) never touch this cap. Tune with the log: grep
+    # "web search failed" after a run — errors clustering means lower it;
+    # zero errors means it has headroom to go up.
+    LLM_MAX_CONCURRENT_SEARCH_CALLS: int = 6
 
     # ---- pipeline caps ----
     MAX_COMPANIES_HARD_CAP: int = 30   # absolute cap per run
@@ -100,9 +192,10 @@ class Settings:
     # starts in its place, so failures don't shrink the number of drafts
     # delivered.
     DISCOVERY_BENCH_EXTRA: int = 5
-    # All companies in a run fire their LLM calls concurrently, uncapped
-    # (bounded only by MAX_COMPANIES_HARD_CAP) — see llm.py's rate-limit
-    # retry/backoff for how bursts of simultaneous requests are handled.
+    # All companies in a run advance their step chains concurrently; actual
+    # LLM requests are throttled by LLM_MAX_CONCURRENT_CALLS above, and
+    # whatever still slips through to a 429 is absorbed by llm.py's
+    # retry/backoff.
     HUNTER_CONCURRENCY: int = 10  # concurrent Hunter API calls (semaphore) — within Hunter's 15 req/s email-finder limit
     # Each company task starts after a random 0..N-second delay instead of
     # all slamming the Anthropic tokens-per-minute window in the same
@@ -121,11 +214,13 @@ class Settings:
     # appears on the run page once a run has been in the RUNNING phase this
     # long; the run stops itself (keeping whatever companies already
     # finished) after RUN_HARD_TIMEOUT_SECONDS regardless of whether the
-    # button was clicked. 40 (not 30) minutes since the post-draft
-    # fact-check + claim revision lengthened each company's chain — a real
-    # run was cut at 32 minutes with drafts still in flight. Env-overridable.
+    # button was clicked. 50 minutes since independent draft verification
+    # (bigger search budget, 15-minute ceiling, web recheck after a claim
+    # revision) lengthened each company's chain — earlier, 40 was chosen
+    # when a real run was cut at 32 minutes with drafts still in flight.
+    # Env-overridable.
     TIMEOUT_BUTTON_AFTER_SECONDS: int = 10 * 60
-    RUN_HARD_TIMEOUT_SECONDS: int = 40 * 60
+    RUN_HARD_TIMEOUT_SECONDS: int = 50 * 60
 
     # Hunter: minimum confidence score (0-100) to treat an email as valid
     MIN_EMAIL_SCORE: int = 50
@@ -194,7 +289,12 @@ class Settings:
         google_client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
         google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
         return cls(
-            LOG_LEVEL=os.environ.get("LOG_LEVEL", "INFO").strip().upper(),
+            LOG_LEVEL=os.environ.get("LOG_LEVEL", "DEBUG").strip().upper(),
+            # Overridable so the test runner can point the whole app (SQLite
+            # DB, resumes, tokens) at a throwaway copy of data/ — the suite
+            # used to run against the REAL database, and test writes/cleanup
+            # polluted and damaged real user data.
+            DATA_DIR=Path(os.environ.get("DATA_DIR") or (BASE_DIR / "data")),
             LOG_DIR=Path(os.environ.get("LOG_DIR") or (BASE_DIR / "data" / "logs")),
             CONTACT_CALL_TIMEOUT_SECONDS=_env_int(
                 "CONTACT_CALL_TIMEOUT_SECONDS", 8 * 60, minimum=60
@@ -203,13 +303,31 @@ class Settings:
                 "RESEARCH_CALL_TIMEOUT_SECONDS", 8 * 60, minimum=60
             ),
             VERIFY_CALL_TIMEOUT_SECONDS=_env_int(
-                "VERIFY_CALL_TIMEOUT_SECONDS", 8 * 60, minimum=60
+                "VERIFY_CALL_TIMEOUT_SECONDS", 15 * 60, minimum=60
             ),
             LLM_CALL_TIMEOUT_SECONDS=_env_int(
                 "LLM_CALL_TIMEOUT_SECONDS", 15 * 60, minimum=60
             ),
+            CONNECTION_ERROR_MAX_RETRIES=_env_int(
+                "CONNECTION_ERROR_MAX_RETRIES", 3, minimum=0
+            ),
+            CONNECTION_WAIT_SECONDS=_env_int(
+                "CONNECTION_WAIT_SECONDS", 120, minimum=1
+            ),
+            CONNECTION_PROBE_INTERVAL_SECONDS=_env_int(
+                "CONNECTION_PROBE_INTERVAL_SECONDS", 5, minimum=1
+            ),
+            LLM_STALL_TIMEOUT_SECONDS=_env_int(
+                "LLM_STALL_TIMEOUT_SECONDS", 120, minimum=10
+            ),
+            LLM_MAX_CONCURRENT_CALLS=_env_int(
+                "LLM_MAX_CONCURRENT_CALLS", 30, minimum=1
+            ),
+            LLM_MAX_CONCURRENT_SEARCH_CALLS=_env_int(
+                "LLM_MAX_CONCURRENT_SEARCH_CALLS", 6, minimum=1
+            ),
             RUN_HARD_TIMEOUT_SECONDS=_env_int(
-                "RUN_HARD_TIMEOUT_SECONDS", 40 * 60, minimum=60
+                "RUN_HARD_TIMEOUT_SECONDS", 50 * 60, minimum=60
             ),
             MAX_RUNS_PER_DAY=_env_int("MAX_RUNS_PER_DAY", 5, minimum=1),
             GOOGLE_CLIENT_ID=google_client_id,

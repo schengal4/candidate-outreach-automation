@@ -9,6 +9,24 @@
   &nbsp;·&nbsp; red-flag detection {{ "on" if c.red_flag_detection else "off" }}
 </p>
 
+{% if active_run %}
+{% if active_run.phase == "review" %}
+<article class="flag">
+  <strong>⏸ A run is waiting for your approval.</strong>
+  <p class="muted">Company discovery finished — nothing continues (and nothing further is spent)
+     until you review the shortlist.</p>
+  <a href="/runs/{{ active_run.id }}" role="button">Review the shortlist</a>
+</article>
+{% else %}
+<article>
+  <strong>A run is in progress.</strong>
+  <p class="muted">{{ "Discovering target companies…" if active_run.phase == "discovering"
+                      else "Researching contacts and drafting emails…" }}</p>
+  <a href="/runs/{{ active_run.id }}" role="button" class="secondary">Open the run</a>
+</article>
+{% endif %}
+{% endif %}
+
 {% if pending %}
 <article class="flag">
   <strong>Did you send to these?</strong>
@@ -22,6 +40,11 @@
   <div class="grid">
     <form action="/sent/{{ c.id }}/confirm_all" method="post">
       <button type="submit">Yes — I sent all of these</button>
+    </form>
+    <form action="/sent/{{ c.id }}/dismiss_pending" method="post"
+          onsubmit="return confirm('Remove these {{ pending|length }} entr{{ 'y' if pending|length == 1 else 'ies' }} from your sent list? These contacts become reachable by future runs again.')">
+      {% for e in pending %}<input type="hidden" name="entry_ids" value="{{ e.id }}">{% endfor %}
+      <button type="submit" class="secondary">No — I didn't send these</button>
     </form>
     <a href="/sent/{{ c.id }}" role="button" class="secondary">Review sent list</a>
   </div>
@@ -61,10 +84,16 @@
   {% endif %}
 </article>
 
+{% if active_run and active_run.phase != "review" %}
+<p class="muted">A new run can start once the current one finishes —
+   <a href="/runs/{{ active_run.id }}">open the run in progress</a>.</p>
+{% else %}
 <form action="/candidates/{{ c.id }}/runs" method="post">
   <button type="submit">Start outreach run</button>
 </form>
-<p class="muted">A run discovers companies, then pauses for your review before any contact research happens.</p>
+<p class="muted">A run discovers companies, then pauses for your review before any contact research happens.
+{% if active_run %}Starting a new run doesn't discard the shortlist waiting above — you can still approve it later.{% endif %}</p>
+{% endif %}
 
 {% if past_runs %}
 <h3>Runs</h3>

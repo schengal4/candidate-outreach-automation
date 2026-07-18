@@ -32,7 +32,7 @@ from . import auth, backup, config, db, gmail_client, sent_list, storage
 from .auth import LoginError
 from .deps import NotFoundError, owned_candidate, owned_run, session_owner
 from .fsutil import atomic_write_bytes
-from .gmail_client import GmailNotConfigured
+from .gmail_client import GmailAuthExpired, GmailNotConfigured
 from .logging_setup import configure_logging
 from .models import Candidate, CompanyStatus, RunPhase
 from .resume import ensure_resume_pdf, extract_docx_text, resume_docx_path, resume_pdf_path
@@ -203,13 +203,24 @@ async def create_candidate(
     return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 
+# Raw phases are internal enum names — "review" reads as passive when it
+# actually means the pipeline is stopped waiting on the user.
+PHASE_LABELS = {
+    RunPhase.DISCOVERING: "discovering companies…",
+    RunPhase.REVIEW: "⏸ waiting for your approval",
+    RunPhase.RUNNING: "in progress…",
+    RunPhase.DONE: "finished",
+    RunPhase.ERROR: "failed",
+}
+
+
 @router.get("/candidates/{candidate_id}", response_class=HTMLResponse)
 async def candidate_page(request: Request, candidate: Candidate = Depends(owned_candidate)):
     past_runs = [
         {
             "id": r.id,
             "when": datetime.fromtimestamp(r.created_at).strftime("%b %d, %Y %I:%M %p"),
-            "phase": r.phase,
+            "phase": PHASE_LABELS.get(r.phase, r.phase),
             "drafts": sum(1 for co in r.companies if co.status == CompanyStatus.DONE),
             "companies": len(r.companies) or len(r.discovered),
         }
@@ -223,6 +234,7 @@ async def candidate_page(request: Request, candidate: Candidate = Depends(owned_
             "pending": sent_list.pending_confirmation(candidate.id),
             "gmail_connected": gmail_client.is_connected(candidate.id),
             "past_runs": past_runs,
+            "active_run": manager.active_run(candidate.id),
         },
     )
 
@@ -378,6 +390,17 @@ async def gmail_disconnect(candidate: Candidate = Depends(owned_candidate)):
 # ------------------------------------------------------------------ #
 @router.post("/candidates/{candidate_id}/runs")
 async def start_run(candidate: Candidate = Depends(owned_candidate)):
+    # A discovery or pipeline already in flight is already spending money —
+    # a second click (usually an accidental double-click) lands on the run
+    # that's already going instead of spawning a concurrent one. A run parked
+    # at the review gate doesn't block: a fresh discovery is the escape hatch
+    # from a shortlist that isn't worth approving.
+    active = manager.active_run(candidate.id)
+    if active is not None and active.phase != RunPhase.REVIEW:
+        logger.info(
+            "Run refused for candidate %s: run %s is still active", candidate.id, active.id
+        )
+        return RedirectResponse(f"/runs/{active.id}", status_code=303)
     if manager.daily_cap_reached(candidate.id):
         cap = config.settings.MAX_RUNS_PER_DAY
         logger.warning(
@@ -479,18 +502,31 @@ async def save_all_to_gmail(owned=Depends(owned_run)):
     """Batch version of save_to_gmail — one explicit click after all drafts in
     the run are visible on screen. Per-draft failures don't stop the rest."""
     run, candidate = owned
-    for company in run.companies:
+    eligible = [
+        c for c in run.companies
         # Skip manual-outreach drafts with no email (see save_to_gmail).
-        if company.draft_subject and company.email and not company.gmail_draft_created:
-            try:
-                await gmail_client.create_draft(candidate, company)
-                company.gmail_draft_created = True
-                company.gmail_error = ""
-            except Exception as exc:
-                logger.warning(
-                    "Run %s: Gmail draft failed for %s: %s", run.id, company.name, exc
-                )
-                company.gmail_error = str(exc)
+        if c.draft_subject and c.email and not c.gmail_draft_created
+    ]
+    for i, company in enumerate(eligible):
+        try:
+            await gmail_client.create_draft(candidate, company)
+            company.gmail_draft_created = True
+            company.gmail_error = ""
+        except GmailAuthExpired as exc:
+            # The grant is dead — every remaining attempt would fail the same
+            # way, so mark them all and stop instead of hammering Google.
+            logger.warning(
+                "Run %s: Gmail authorization expired at %s — skipping the "
+                "remaining %d draft(s)", run.id, company.name, len(eligible) - i - 1
+            )
+            for remaining in eligible[i:]:
+                remaining.gmail_error = str(exc)
+            break
+        except Exception as exc:
+            logger.warning(
+                "Run %s: Gmail draft failed for %s: %s", run.id, company.name, exc
+            )
+            company.gmail_error = str(exc)
     manager.save(run)  # the saved-to-Gmail marks survive restarts too
     return RedirectResponse(f"/runs/{run.id}", status_code=303)
 
@@ -588,6 +624,17 @@ async def sent_update(
 @router.post("/sent/{candidate_id}/confirm_all")
 async def sent_confirm_all(candidate: Candidate = Depends(owned_candidate)):
     sent_list.confirm_all(candidate.id)
+    return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
+
+
+@router.post("/sent/{candidate_id}/dismiss_pending")
+async def sent_dismiss_pending(
+    candidate: Candidate = Depends(owned_candidate),
+    entry_ids: list[int] = Form([]),
+):
+    # Deletes only the ids the nudge displayed (and only if still unconfirmed),
+    # so entries auto-added by a concurrently running pipeline survive.
+    sent_list.remove_unconfirmed(candidate.id, entry_ids)
     return RedirectResponse(f"/candidates/{candidate.id}", status_code=303)
 
 

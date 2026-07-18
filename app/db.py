@@ -62,6 +62,20 @@ CREATE TABLE IF NOT EXISTS run_ledger (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_candidate ON run_ledger(candidate_id);
 
+-- Durable per-company failure memory (one row per candidate+domain): written
+-- when a company drops for a company-specific reason (contacts can't be
+-- found/verified), cleared when a later run drafts it successfully. Feeds the
+-- review gate's "failed last time" flag independently of run-report retention
+-- (KEEP_RUNS_PER_CANDIDATE) — real data showed failures from 6+ runs back
+-- resurfacing unflagged because the runs that recorded them had been pruned.
+CREATE TABLE IF NOT EXISTS company_failures (
+    candidate_id   TEXT NOT NULL,
+    domain         TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    last_failed_at REAL NOT NULL,
+    PRIMARY KEY (candidate_id, domain)
+);
+
 CREATE TABLE IF NOT EXISTS sent_entries (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     candidate_id         TEXT NOT NULL,

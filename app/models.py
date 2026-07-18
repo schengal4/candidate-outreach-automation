@@ -61,6 +61,27 @@ class Candidate:
         return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
 
+# Signals in a verification caveat that raise a SERIOUS question about
+# whether the contact still holds their role — departure evidence, a second
+# conflicting profile, acquisition fallout, a newer title found by the
+# fact-check — as opposed to the routine "title from an undated page, worth
+# a glance" nudge. Drives the run report's flag tiers: real runs stacked so
+# many equal-weight amber warnings that users stopped reading them.
+_EMPLOYMENT_DOUBT_RE = re.compile(
+    r"may have left|left the company|no longer|departed|departure|"
+    r"stepped back|stepped down|successor|acquired|acquisition|merged|"
+    r"wrong person|could not be matched to this person|"
+    r"updated role/title|confirm employment",
+    re.IGNORECASE,
+)
+
+
+def employment_doubt(text: str) -> bool:
+    """True when a verification caveat questions the contact's employment
+    itself (not merely the exact wording of their title)."""
+    return bool(_EMPLOYMENT_DOUBT_RE.search(text or ""))
+
+
 # ------------------------------------------------------------------ #
 # Contacts
 # ------------------------------------------------------------------ #
@@ -135,17 +156,22 @@ class CompanyState:
     # the report template tolerates both shapes.
     research_items: List[Any] = field(default_factory=list)
     red_flags: List[str] = field(default_factory=list)
+    # Research passes that produced nothing usable — human-readable reasons
+    # rendered in the run report. Non-empty means the draft was written with
+    # reduced personalization; non-empty WITH an empty research_items means
+    # no personalization at all (a priority flag — the email reads generic
+    # and the user should add their own hook before sending).
+    research_failures: List[str] = field(default_factory=list)
     draft_subject: str = ""
     draft_body: str = ""
-    # Banned style phrasings that survived the draft's one redraft attempt.
-    # Empty on a clean draft. The pipeline can't hard-block these without
-    # risking an infinite redraft loop, so a non-empty list surfaces a
-    # "review the wording" flag in the run report instead of shipping silently.
+    # Banned style phrasings detected in the draft. Empty on a clean draft.
+    # Persisted for diagnostics only — the run report deliberately does NOT
+    # render wording nits; they buried the factual flags users must act on.
     draft_banned_phrases: List[str] = field(default_factory=list)
-    # Claims the post-draft fact-check (pipeline step 6) could not ground in
-    # the research notes or confirm by web search — "unsupported: ..." /
-    # "unverified: ..." strings shown as a review flag in the run report.
-    # Empty on a clean draft.
+    # Claims the post-draft fact-check (pipeline step 6) could not confirm
+    # independently by web search — "unsupported: ..." / "unverified: ..."
+    # strings shown as a review flag in the run report. Empty on a clean
+    # draft.
     draft_flagged_claims: List[str] = field(default_factory=list)
     # Non-empty when the fact-check call itself failed: the draft is kept
     # (the check is a safety net, not a gate) but the report tells the user
@@ -153,6 +179,44 @@ class CompanyState:
     draft_verify_error: str = ""
     gmail_draft_created: bool = False
     gmail_error: str = ""
+
+    # ---- report flag tiers (rendered by _run_panel.html) ----
+    # Real runs stacked so many equal-weight warnings that users tuned them
+    # out. Flags are split by severity: PRIORITY (contradicted claims,
+    # employment doubts, unchecked drafts, red flags) renders red and is
+    # summarized at the top of the report; routine confirm-this nudges stay
+    # amber; wording nits render muted.
+    def unsupported_claims(self) -> List[str]:
+        """Flags the fact-check found contradicted or overstated — priority."""
+        return [f for f in self.draft_flagged_claims if f.startswith("unsupported")]
+
+    def unverified_claims(self) -> List[str]:
+        """Flags the fact-check merely couldn't confirm either way — routine."""
+        return [f for f in self.draft_flagged_claims if not f.startswith("unsupported")]
+
+    def contact_employment_doubt(self) -> bool:
+        return bool(
+            self.contact_used and employment_doubt(self.contact_used.verification_caveat)
+        )
+
+    def priority_flags(self) -> List[str]:
+        """Short labels for this company's must-look problems; the report
+        leads with them so they aren't buried among routine nudges."""
+        flags = []
+        if self.contact_employment_doubt():
+            flags.append("contact's employment in question")
+        if self.unsupported_claims():
+            flags.append("a claim failed the fact-check")
+        if self.draft_verify_error:
+            flags.append("draft was never fact-checked")
+        if self.research_failures and not self.research_items:
+            # Partial research (some items survived) is routine — reasons
+            # live in the report's collapsed details, not a banner. NO
+            # research means the email has no personal hook at all.
+            flags.append("research failed — draft is not personalized")
+        if self.red_flags:
+            flags.append("red flags found")
+        return flags
 
     def to_dict(self) -> Dict[str, Any]:
         d = dict(self.__dict__)

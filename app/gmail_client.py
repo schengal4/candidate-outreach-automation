@@ -24,6 +24,7 @@ from html import escape
 from typing import Dict, Optional
 
 import requests
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -39,6 +40,19 @@ logger = logging.getLogger("app.gmail")
 
 class GmailNotConfigured(Exception):
     """Raised when GOOGLE_CLIENT_ID/SECRET aren't set."""
+
+
+class GmailAuthExpired(Exception):
+    """The stored Gmail authorization no longer works (Google reports the
+    token expired or revoked — e.g. the user revoked access, or Google
+    expires test-mode app tokens after 7 days). The recovery is always the
+    same, so the message says it; str(this) is shown directly in the UI."""
+
+    def __init__(self):
+        super().__init__(
+            "Your Gmail connection has expired or been revoked. "
+            "Reconnect Gmail from the profile page, then try again."
+        )
 
 
 def _require_configured() -> None:
@@ -124,19 +138,42 @@ def _load_credentials(candidate_id: str) -> Optional[Credentials]:
         info, scopes=list(config.settings.GMAIL_SCOPES)
     )
     if creds.expired and creds.refresh_token:
-        creds.refresh(GoogleAuthRequest())
+        try:
+            creds.refresh(GoogleAuthRequest())
+        except RefreshError as exc:
+            # invalid_grant: the grant itself is dead — no retry can help.
+            # Raise the friendly error instead of leaking Google's raw
+            # ('invalid_grant: ...', {...}) tuple into the UI.
+            logger.warning(
+                "Gmail token refresh failed for candidate %s: %s", candidate_id, exc
+            )
+            raise GmailAuthExpired() from exc
         _save_credentials(candidate_id, creds)  # access token rotated — persist it
     return creds
 
 
 def disconnect(candidate_id: str) -> None:
-    """Revoke the grant at Google, then remove the local token file."""
-    creds = _load_credentials(candidate_id)
-    if creds:
+    """Revoke the grant at Google, then remove the local token file.
+
+    Must succeed even when the stored token is expired or already revoked —
+    disconnect-then-reconnect is exactly how the user recovers from a dead
+    grant, so this reads the raw token file instead of _load_credentials
+    (whose refresh would raise on the very token being discarded)."""
+    path = _token_path(candidate_id)
+    token = ""
+    if path.exists():
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+            # Revoking the refresh token kills the whole grant; fall back to
+            # the access token if that's all we have.
+            token = info.get("refresh_token") or info.get("token") or ""
+        except (ValueError, OSError):
+            pass  # unreadable file — nothing to revoke, still delete below
+    if token:
         try:
             requests.post(
                 "https://oauth2.googleapis.com/revoke",
-                params={"token": creds.token},
+                params={"token": token},
                 headers={"content-type": "application/x-www-form-urlencoded"},
                 timeout=10,
             )
@@ -146,7 +183,6 @@ def disconnect(candidate_id: str) -> None:
                 "Gmail token revoke failed for candidate %s (removing local token anyway)",
                 candidate_id, exc_info=True,
             )
-    path = _token_path(candidate_id)
     if path.exists():
         path.unlink()
         logger.info("Gmail disconnected for candidate %s", candidate_id)

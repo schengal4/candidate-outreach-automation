@@ -48,6 +48,14 @@ class RunManager:
             reverse=True,
         )
 
+    def active_run(self, candidate_id: str) -> Optional[RunState]:
+        """The newest run still in flight — discovering, paused at the review
+        gate, or running the pipeline. None once everything is settled."""
+        for r in self.for_candidate(candidate_id):
+            if r.phase in (RunPhase.DISCOVERING, RunPhase.REVIEW, RunPhase.RUNNING):
+                return r
+        return None
+
     def save(self, run: RunState) -> None:
         """Persist a run mutated outside the pipeline (e.g. Gmail-save marks)."""
         run_store.save_run(run)
@@ -71,12 +79,18 @@ class RunManager:
         run_store.prune_candidate_runs(candidate.id, self.runs)
         previous = [r for r in self.runs.values()
                     if r.candidate_id == candidate.id and r.id != run.id]
-        self._spawn(pipeline.run_discovery(run, candidate, previous_runs=previous))
+        self._spawn(
+            pipeline.run_discovery(run, candidate, previous_runs=previous),
+            name=f"discovery:{run.id}",
+        )
         return run
 
     def approve(self, run: RunState, candidate: Candidate, approved_domains: List[str]) -> None:
         """Start the pipeline for the review gate's approved companies."""
-        self._spawn(pipeline.run_pipeline(run, candidate, approved_domains))
+        self._spawn(
+            pipeline.run_pipeline(run, candidate, approved_domains),
+            name=f"pipeline:{run.id}",
+        )
         run.phase = RunPhase.RUNNING  # flip immediately so the page starts polling
 
     def stop_early(self, run: RunState) -> None:
@@ -90,8 +104,10 @@ class RunManager:
         run_store.delete_candidate_runs(candidate_id, self.runs)
 
     # ---- background tasks ----
-    def _spawn(self, coro) -> None:
-        task = asyncio.create_task(coro)
+    def _spawn(self, coro, name: Optional[str] = None) -> None:
+        # `name` shows up in the task-failed log line below — the default
+        # "Task-42" identifies nothing when that last-resort error fires.
+        task = asyncio.create_task(coro, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._on_task_done)
 

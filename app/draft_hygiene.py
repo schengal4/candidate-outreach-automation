@@ -26,9 +26,9 @@ def strip_cite_tags(text: str) -> str:
 # leaked "caught my attention" (three times in one run), "stuck with me", and
 # "see if there's a fit" straight past the prompt rule, so — like the
 # greeting/closing guarantee below — enforcement can't live in the prompt
-# alone. A hit triggers ONE redraft (see steps.draft_email); phrases here
-# should be high-signal AI/cold-outreach tells, not words a good email might
-# need.
+# alone. A hit is flagged on the draft result (see steps.draft_email) so the
+# run report asks the user to fix the wording; phrases here should be
+# high-signal AI/cold-outreach tells, not words a good email might need.
 _BANNED_STYLE_RE = re.compile(
     "|".join(
         [
@@ -54,6 +54,11 @@ _BANNED_STYLE_RE = re.compile(
             r"i'?d welcome a short conversation",
             r"there'?s a fit",
             r"i'?ve been following your work",
+            r"\bi offer\b",  # resume-speak: "I offer three years of experience"
+            # The curiosity-dressed ask ("I'd like to hear how your team
+            # thinks about X") — the recipient knows it's a job inquiry.
+            r"i'?d (?:like|love) to hear (?:how|more about|where)",
+            r"from one \w+ to another",
         ]
     ),
     re.IGNORECASE,
@@ -108,15 +113,31 @@ def break_up_wall_of_text(body: str, max_sentences: int = 4) -> str:
 # the guarantee can't live in the prompt alone.
 _GREETING_RE = re.compile(r"^(hi|hello|hey|dear)\b", re.IGNORECASE)
 
+# A final line that is really a question squeezed into the closing-comma
+# format ("Would you be open to a short call sometime,") — the format rule
+# demands the body end in a comma, so models comply by mangling their own
+# question, and a real recipient reads it as a typo. Interrogative opener +
+# a you/we somewhere + trailing comma; plain closings ("Best,", "Would love
+# to talk,") don't match.
+_QUESTION_AS_CLOSING_RE = re.compile(
+    r"^(?:would|could|can|will|do|does|are|is|should|may|might)\b.*\b(?:you|we)\b.*,$",
+    re.IGNORECASE,
+)
+
 
 def ensure_greeting_and_closing(body: str, first_name: str) -> str:
     """Guarantee the email opens by addressing the contact and ends with a
-    closing line ("Best," etc.) ahead of the auto-appended signature."""
+    closing line ("Best," etc.) ahead of the auto-appended signature. A final
+    question gets its question mark back and a real closing after it."""
     body = body.strip()
     if not body:
         return body
     if first_name and not _GREETING_RE.match(body):
         body = f"Hi {first_name},\n\n{body}"
+    lines = body.splitlines()
+    if _QUESTION_AS_CLOSING_RE.match(lines[-1].strip()):
+        lines[-1] = lines[-1].rstrip().rstrip(",") + "?"
+        body = "\n".join(lines)
     if not body.splitlines()[-1].strip().endswith(","):
         body += "\n\nBest,"
     return body

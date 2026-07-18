@@ -135,6 +135,21 @@ def remove_entry(candidate_id: str, entry_id: int) -> None:
     )
 
 
+def remove_unconfirmed(candidate_id: str, entry_ids: List[int]) -> None:
+    """Delete the given entries only if still unconfirmed — the "No, I didn't
+    send those" answer to the reconciliation nudge. Scoping to the ids shown
+    in the nudge (not all unconfirmed rows) means a pipeline appending new
+    entries concurrently can't have them silently deleted."""
+    if not entry_ids:
+        return
+    placeholders = ", ".join("?" for _ in entry_ids)
+    db.execute(
+        f"DELETE FROM sent_entries WHERE id IN ({placeholders})"
+        " AND candidate_id = ? AND confirmed_sent = 0",
+        (*entry_ids, candidate_id),
+    )
+
+
 def confirm_all(candidate_id: str) -> None:
     db.execute(
         "UPDATE sent_entries SET confirmed_sent = 1 WHERE candidate_id = ?",

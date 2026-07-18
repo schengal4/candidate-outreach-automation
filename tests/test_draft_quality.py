@@ -1,5 +1,7 @@
-"""Draft writing-quality backstops: the banned-phrase detector, the
-one-redraft pass in draft_email, and accomplishment rotation across a batch."""
+"""Draft writing-quality backstops: the banned-phrase detector, the one-shot
+style redraft it triggers (adopted only when strictly cleaner), the
+banned-phrase flag on the draft result, and accomplishment rotation across
+a batch."""
 import asyncio
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
@@ -27,27 +29,51 @@ assert "seems central to what" in hits
 assert banned_style_hits(
     "The ASCO integration is the right way to handle clinical AI trust."
 ) == []
+# Tells from the 2026-07-17 run's recipient-perspective review: resume-speak,
+# the curiosity-dressed ask, and presumed peer status.
+hits = banned_style_hits(
+    "I offer close to three years of experience. I'd like to hear how your "
+    "team thinks about this, from one builder to another."
+)
+assert "i offer" in hits and "from one builder to another" in hits, hits
+assert any(h.startswith("i'd like to hear") for h in hits), hits
+assert banned_style_hits("I built the offer-comparison flow last year.") == []
 print("PASS: detector flags real-run leaks and passes clean prose")
 
-# 2. Banned phrasing triggers exactly one redraft; clean version is kept
+# 2. Banned phrasing triggers ONE style redraft; a cleaner redo is adopted
+#    (with the original featured_accomplishment kept) and the flag clears
 calls = []
 
 async def fake_ask_json(system, user, **kw):
-    calls.append(user)
-    if len(calls) == 1:
-        return {"subject": "s", "body": "Hi Ann,\n\nYour work caught my attention.\n\nThanks,",
-                "featured_accomplishment": "trial matching app"}
-    return {"subject": "s", "body": "Hi Ann,\n\nFresh specific wording.\n\nThanks,",
+    calls.append({"user": user, "label": kw.get("label", "")})
+    if kw.get("label", "").startswith("restyle:"):
+        return {"subject": "s", "body": "Hi Ann,\n\nYour work stood out to me.\n\nThanks,",
+                "featured_accomplishment": "SHOULD BE IGNORED"}
+    return {"subject": "s", "body": "Hi Ann,\n\nYour work caught my attention.\n\nThanks,",
             "featured_accomplishment": "trial matching app"}
 
 steps.ask_json = fake_ask_json
 result = asyncio.run(steps.draft_email(cand, contact, "TestCo", research))
-assert len(calls) == 2, f"expected 1 redraft, saw {len(calls)} calls"
-assert "caught my attention" in calls[1], "retry prompt should name the violation"
-assert "caught my attention" not in result.body
-print("PASS: banned phrasing triggers one redraft and the clean version is kept")
+assert len(calls) == 2, f"expected draft + restyle, saw {len(calls)} calls"
+assert calls[1]["label"] == "restyle:TestCo"
+assert "caught my attention" in calls[1]["user"], "redraft must name the banned phrasing"
+assert "stood out to me" in result.body and "caught my attention" not in result.body
+assert result.banned_phrases == [], result.banned_phrases
+assert result.featured_accomplishment == "trial matching app", \
+    "restyle must not change the accomplishment bookkeeping"
+print("PASS: banned phrasing triggers one style redraft; cleaner redo adopted")
 
-# 3. Clean first draft -> no second call
+# 2b. A redo that is no cleaner is discarded — original kept, still flagged
+async def fake_no_cleaner(system, user, **kw):
+    return {"subject": "s", "body": "Hi Ann,\n\nYour work caught my attention.\n\nThanks,",
+            "featured_accomplishment": "trial matching app"}
+
+steps.ask_json = fake_no_cleaner
+result = asyncio.run(steps.draft_email(cand, contact, "TestCo", research))
+assert "caught my attention" in result.banned_phrases, result.banned_phrases
+print("PASS: a no-cleaner redo is discarded and the leak stays flagged")
+
+# 3. Clean draft -> one call, no flag
 calls.clear()
 
 async def fake_clean(system, user, **kw):
@@ -71,17 +97,17 @@ assert "already featured" in calls[1] and "segmentation tool" in calls[1]
 assert used == ["segmentation tool", "segmentation tool"]
 print("PASS: featured accomplishments are tracked and fed to later drafts")
 
-# 5. Phrasing that survives the redraft is reported on the result so the run
-#    report can flag it, instead of the leak living only in a log line. A clean
-#    draft leaves the list empty.
-async def fake_always_banned(system, user, **kw):
+# 5. Banned phrasing is reported on the result so the run report can flag it,
+#    instead of the leak living only in a log line. A clean draft leaves the
+#    list empty.
+async def fake_banned(system, user, **kw):
     return {"subject": "s", "body": "Hi Ann,\n\nYour talk stuck with me.\n\nThanks,",
             "featured_accomplishment": "trial matching app"}
 
-steps.ask_json = fake_always_banned
-survived = asyncio.run(steps.draft_email(cand, contact, "TestCo", research))
-assert "stuck with me" in survived.banned_phrases, survived.banned_phrases
-print("PASS: surviving banned phrasing is reported on the draft result")
+steps.ask_json = fake_banned
+flagged = asyncio.run(steps.draft_email(cand, contact, "TestCo", research))
+assert "stuck with me" in flagged.banned_phrases, flagged.banned_phrases
+print("PASS: banned phrasing is reported on the draft result")
 
 steps.ask_json = fake_clean
 clean = asyncio.run(steps.draft_email(cand, contact, "TestCo", research))

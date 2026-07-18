@@ -32,7 +32,7 @@ class FakeTextBlock:
 async def test_effort_omitted_by_default():
     captured = []
 
-    async def fake_send_request(client, kwargs, report):
+    async def fake_send_request(client, kwargs, report, label=""):
         captured.append(kwargs)
         return FakeMessage([FakeTextBlock('{"ok": true}')])
 
@@ -45,7 +45,7 @@ async def test_effort_omitted_by_default():
 async def test_effort_medium_sets_output_config():
     captured = []
 
-    async def fake_send_request(client, kwargs, report):
+    async def fake_send_request(client, kwargs, report, label=""):
         captured.append(kwargs)
         return FakeMessage([FakeTextBlock('{"ok": true}')])
 
