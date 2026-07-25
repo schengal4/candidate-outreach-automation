@@ -215,9 +215,11 @@ finally:
 contact_calls = []
 sent_calls = []
 
+config.settings.CONTACT_LEADS_LIMIT = 0  # never hit Hunter's live API from tests
+
 async def fake_identify(candidate, company_name, domain, excluded, **kw):
     contact_calls.append(domain)
-    return Contact(first_name="Jane", last_name="Doe", title="CTO", employment_verified=True)
+    return Contact(first_name="Jane", last_name="Doe", title="CTO", employment_verified=True), None
 
 async def fake_lookup(domain, contact, blocked):
     return "jane@x.com", 90, ""

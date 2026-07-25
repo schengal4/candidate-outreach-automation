@@ -21,8 +21,15 @@ from app.llm import LLMError, LLMTimeoutError
 from app.models import Candidate, CompanyState, CompanyStatus, Contact
 from app.steps import DraftResult, ResearchResult, VerifyResult
 
-CONTACT_REPLY = {"first_name": "Jane", "last_name": "Doe", "title": "CTO",
-                 "employment_verified": True}
+config.settings.CONTACT_LEADS_LIMIT = 0  # never hit Hunter's live API from tests
+
+CONTACT_REPLY = {
+    "primary": {"first_name": "Jane", "last_name": "Doe", "title": "CTO",
+                "employment_verified": True},
+    "fallback": {"first_name": "", "last_name": "", "title": "",
+                 "linkedin_url": "", "linkedin_url_source": "",
+                 "employment_verified": False, "evidence": "", "verification_caveat": ""},
+}
 CAND = Candidate(id="tctr", name="T", email="", current_employer="E", resume_text="r")
 
 # ---- 1. steps.identify_contact retry ------------------------------------ #
@@ -49,8 +56,9 @@ try:
     # Timeout -> one retry on the smaller budget AND the tighter clock
     calls.clear()
     steps.ask_json = make_fake(["timeout", "ok"])
-    contact = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
+    contact, fallback = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
     assert contact and contact.full_name == "Jane Doe"
+    assert fallback is None  # empty-name sentinel parses to no fallback
     assert calls == [
         (config.settings.CONTACT_WEB_SEARCH_MAX_USES,
          config.settings.CONTACT_CALL_TIMEOUT_SECONDS),
@@ -97,8 +105,9 @@ def run_scenario(primary_verified: bool, backup_outcome):
         if kw.get("label", "").startswith("backup:"):
             if backup_outcome == "timeout":
                 raise LLMTimeoutError("LLM call timed out after 8 minutes (backup:X).")
-            return backup_outcome
-        return Contact(**(VERIFIED if primary_verified else UNVERIFIED))
+            return backup_outcome, None
+        # No inline fallback in these scenarios — the escalation call runs.
+        return Contact(**(VERIFIED if primary_verified else UNVERIFIED)), None
 
     async def fake_lookup(domain, contact, blocked):
         return None, None, ""  # Hunter never finds an email in these scenarios

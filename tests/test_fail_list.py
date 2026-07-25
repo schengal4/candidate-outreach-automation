@@ -10,7 +10,9 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 
 import app.pipeline as pipeline
 import app.steps as steps
-from app import run_store
+from app import config, run_store
+
+config.settings.CONTACT_LEADS_LIMIT = 0  # never hit Hunter's live API from tests
 from app.llm import LLMError
 from app.models import Candidate, CompanyState, CompanyStatus, Contact, RunPhase, RunState
 from app.steps import DraftResult, ResearchResult, VerifyResult
@@ -23,10 +25,10 @@ def run_company(identify_outcome):
 
     async def fake_identify(candidate, company_name, domain, excluded, **kw):
         if identify_outcome == "none":
-            return None
+            return None, None
         if identify_outcome == "error":
             raise LLMError("kaboom")
-        return identify_outcome
+        return identify_outcome, None
 
     async def fake_lookup(domain, contact, blocked):
         return "jane@x.com", 90, ""

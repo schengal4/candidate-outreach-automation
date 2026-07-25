@@ -84,6 +84,9 @@ def main() -> int:
         env = dict(os.environ)
         env["LOG_DIR"] = TEST_LOG_DIR
         env["DATA_DIR"] = TEST_DATA_DIR
+        # No test may hit Hunter's live domain-search API (the developer's
+        # real HUNTER_API_KEY can be present in the environment).
+        env["CONTACT_LEADS_LIMIT"] = "0"
         if f.name in NEEDS_OPEN_MODE:
             env["REQUIRE_LOGIN"] = "0"
         result = subprocess.run(

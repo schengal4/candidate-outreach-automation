@@ -21,9 +21,10 @@ assert Contact.from_dict(c.to_dict()).verification_caveat == CAVEAT
 assert Contact.from_dict({"first_name": "A"}).verification_caveat == ""  # old run files
 print("PASS: verification_caveat round-trips and defaults empty")
 
-# 2. Part of the enforced contact schema
-assert "verification_caveat" in prompts.CONTACT_SCHEMA["required"]
-print("PASS: verification_caveat is a required field in the contact schema")
+# 2. Part of the enforced contact schema — for the primary AND the fallback
+for person in ("primary", "fallback"):
+    assert "verification_caveat" in prompts.CONTACT_SCHEMA["properties"][person]["required"]
+print("PASS: verification_caveat is a required field for both schema contacts")
 
 # 3. Drafted company shows the "verify before sending" banner
 run = RunState(id="testcaveat001", candidate_id="516e7c4751", phase=RunPhase.DONE)

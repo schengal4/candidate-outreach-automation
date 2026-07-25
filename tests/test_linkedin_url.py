@@ -25,8 +25,9 @@ assert c.linkedin_url == ""
 assert normalize_linkedin_url("  www.linkedin.com/in/y ") == "https://www.linkedin.com/in/y"
 print("PASS: scheme-less LinkedIn URLs are normalized at the model boundary")
 
-# 2. Schema demands provenance for the URL
-assert "linkedin_url_source" in prompts.CONTACT_SCHEMA["required"]
+# 2. Schema demands provenance for the URL — for the primary AND the fallback
+for person in ("primary", "fallback"):
+    assert "linkedin_url_source" in prompts.CONTACT_SCHEMA["properties"][person]["required"]
 assert "guess" in prompts.CONTACT_SYSTEM  # the don't-guess rule is in the prompt
 print("PASS: contact schema requires linkedin_url_source; prompt bans guessed URLs")
 
@@ -34,25 +35,31 @@ print("PASS: contact schema requires linkedin_url_source; prompt bans guessed UR
 CAND = Candidate(id="testliurl", name="T", email="", current_employer="E", resume_text="r")
 
 
-def contact_reply(url, source):
+def person_reply(url, source):
     return {"first_name": "Jane", "last_name": "Doe", "title": "VP",
             "linkedin_url": url, "linkedin_url_source": source,
             "employment_verified": True, "evidence": "e", "verification_caveat": ""}
 
+_NO_FALLBACK = {"first_name": "", "last_name": "", "title": "", "linkedin_url": "",
+                "linkedin_url_source": "", "employment_verified": False,
+                "evidence": "", "verification_caveat": ""}
+
 
 async def fake_unsourced(system, user, **kw):
-    return contact_reply("https://linkedin.com/in/jane-doe", "")
+    return {"primary": person_reply("https://linkedin.com/in/jane-doe", ""),
+            "fallback": _NO_FALLBACK}
 
 async def fake_sourced(system, user, **kw):
-    return contact_reply("linkedin.com/in/janedoe", "LinkedIn result in web search")
+    return {"primary": person_reply("linkedin.com/in/janedoe", "LinkedIn result in web search"),
+            "fallback": _NO_FALLBACK}
 
 real_ask_json = steps.ask_json
 try:
     steps.ask_json = fake_unsourced
-    got = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
+    got, _ = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
     assert got.linkedin_url == "", got.linkedin_url
     steps.ask_json = fake_sourced
-    got = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
+    got, _ = asyncio.run(steps.identify_contact(CAND, "X", "x.com", []))
     assert got.linkedin_url == "https://linkedin.com/in/janedoe"
 finally:
     steps.ask_json = real_ask_json

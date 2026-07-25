@@ -32,7 +32,7 @@ import time
 from collections import deque
 from typing import Dict, Iterable, List
 
-from . import config, llm, run_store, sent_list, steps
+from . import config, hunter_async, llm, run_store, sent_list, steps
 from .draft_hygiene import SIGNATURE_SEP, email_signature
 from .llm import LLMError, LLMTimeoutError
 from .logging_setup import run_id_var
@@ -175,11 +175,17 @@ async def _run_company(
 
     try:
         set_status(CompanyStatus.CONTACTS)
-        company.primary = await steps.identify_contact(
+        # One cheap Hunter directory pull per company: the contact call gets
+        # the names+titles as leads so its searches go to verification rather
+        # than discovery. [] on any failure — identification proceeds as if
+        # the feature didn't exist.
+        leads = await hunter_async.list_people(company.domain)
+        company.primary, inline_fallback = await steps.identify_contact(
             candidate,
             company.name,
             company.domain,
             recently_contacted_names,
+            leads=leads,
             on_progress=report,
             label=f"contact:{company.name}",
         )
@@ -202,31 +208,40 @@ async def _run_company(
                 found_email = True
 
         if not found_email:
-            # Primary wasn't verified or Hunter couldn't find them — only now
-            # spend a second call looking for a backup contact.
-            set_status(CompanyStatus.CONTACTS)
-            excluded = recently_contacted_names + [company.primary.full_name]
-            try:
-                company.backup = await steps.identify_contact(
-                    candidate,
-                    company.name,
-                    company.domain,
-                    excluded,
-                    on_progress=report,
-                    label=f"backup:{company.name}",
-                )
-            except LLMTimeoutError:
-                if not company.primary.employment_verified:
-                    raise  # nothing to fall back to — drops with the timeout reason
-                # The backup search (its retry included) timed out, but the
-                # primary is already verified — a real run dropped a company
-                # here over a search for a contact it didn't need. Fall
-                # through to the manual-outreach path below.
-                logger.warning(
-                    "backup:%s: timed out — falling back to the verified primary contact",
-                    company.name,
-                )
-                company.backup = None
+            # Primary wasn't verified or Hunter couldn't find them. The
+            # contact call's opportunistic fallback (found in the SAME
+            # searches) is free — only when it's absent or unverified does a
+            # second identification call run. A real run spent that second
+            # call on 5 of 12 companies re-deriving org facts the primary
+            # call had already seen.
+            company.backup = inline_fallback
+            if not (company.backup and company.backup.employment_verified):
+                set_status(CompanyStatus.CONTACTS)
+                excluded = recently_contacted_names + [company.primary.full_name]
+                if inline_fallback:
+                    excluded.append(inline_fallback.full_name)
+                try:
+                    company.backup, _ = await steps.identify_contact(
+                        candidate,
+                        company.name,
+                        company.domain,
+                        excluded,
+                        leads=leads,
+                        on_progress=report,
+                        label=f"backup:{company.name}",
+                    )
+                except LLMTimeoutError:
+                    if not company.primary.employment_verified:
+                        raise  # nothing to fall back to — drops with the timeout reason
+                    # The backup search (its retry included) timed out, but the
+                    # primary is already verified — a real run dropped a company
+                    # here over a search for a contact it didn't need. Fall
+                    # through to the manual-outreach path below.
+                    logger.warning(
+                        "backup:%s: timed out — falling back to the verified primary contact",
+                        company.name,
+                    )
+                    company.backup = None
 
             if company.backup and company.backup.employment_verified:
                 set_status(CompanyStatus.EMAIL)

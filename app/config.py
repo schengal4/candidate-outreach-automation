@@ -54,6 +54,11 @@ class Settings:
     # into fast clean failures, which the bench (see DISCOVERY_BENCH_EXTRA)
     # can then backfill.
     CONTACT_WEB_SEARCH_MAX_USES: int = 5
+    # One Hunter domain-search per company feeds the contact call a lead list
+    # (names + titles Hunter's index knows at the domain), so its web searches
+    # go to VERIFYING people instead of discovering them. 0 disables the pull
+    # entirely (the test suite sets this so no test can hit Hunter's live API).
+    CONTACT_LEADS_LIMIT: int = 10
     CONTACT_CALL_TIMEOUT_SECONDS: int = 8 * 60
     # Personalization research gets its own leash too — looser than contact
     # identification (reading a few sources is the point) but tighter than
@@ -299,6 +304,7 @@ class Settings:
             CONTACT_CALL_TIMEOUT_SECONDS=_env_int(
                 "CONTACT_CALL_TIMEOUT_SECONDS", 8 * 60, minimum=60
             ),
+            CONTACT_LEADS_LIMIT=_env_int("CONTACT_LEADS_LIMIT", 10, minimum=0),
             RESEARCH_CALL_TIMEOUT_SECONDS=_env_int(
                 "RESEARCH_CALL_TIMEOUT_SECONDS", 8 * 60, minimum=60
             ),

@@ -43,6 +43,43 @@ def _get_client() -> HunterClient:
     return _client
 
 
+async def list_people(domain: str, limit: Optional[int] = None) -> list:
+    """Names + titles Hunter's index lists at a domain — LEAD material for
+    contact identification (aggregator-grade data: it can point the model at
+    people, never verify them; CONTACT_SYSTEM spells that out). Returns
+    [{"name": ..., "title": ...}] — deliberately no email addresses; emails
+    still go through find_email's confidence gate one contact at a time.
+
+    Returns [] on ANY failure (and when CONTACT_LEADS_LIMIT is 0): leads are
+    optional enrichment, and contact identification must proceed without
+    them exactly as it did before this existed."""
+    if limit is None:
+        limit = config.settings.CONTACT_LEADS_LIMIT
+    if limit <= 0:
+        return []
+    async with _get_semaphore():
+        try:
+            result = await asyncio.to_thread(
+                _get_client().domain_search,
+                domain=domain, limit=limit, type="personal",
+            )
+        except (HunterAPIError, requests.RequestException, ValueError) as exc:
+            logger.warning(
+                "Hunter domain search failed for %s (%s) — proceeding without leads",
+                domain, exc,
+            )
+            return []
+    people = []
+    for entry in (((result or {}).get("data") or {}).get("emails") or []):
+        first = str(entry.get("first_name") or "").strip()
+        last = str(entry.get("last_name") or "").strip()
+        title = str(entry.get("position") or "").strip()
+        if first and last:
+            people.append({"name": f"{first} {last}", "title": title})
+    logger.info("Hunter: %d lead(s) listed at %s", len(people), domain)
+    return people
+
+
 async def find_email(domain: str, first_name: str, last_name: str) -> Tuple[Optional[str], Optional[int], str]:
     """Return (email, score, linkedin_url) if Hunter finds a confident match,
     else (None, None, "").

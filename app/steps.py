@@ -155,9 +155,16 @@ async def identify_contact(
     company_name: str,
     domain: str,
     excluded_names: List[str],
+    leads: Optional[List[Dict]] = None,
     on_progress: Optional[Callable[[str], None]] = None,
     label: str = "contact",
-) -> Optional[Contact]:
+) -> Tuple[Optional[Contact], Optional[Contact]]:
+    """Returns (primary, fallback). The fallback is whatever second
+    hiring-relevant person surfaced in the SAME searches (None when none
+    did) — the orchestrator tries it before paying for a second call.
+    `leads` is Hunter's directory listing for the domain (hunter_async
+    .list_people): starting points the model verifies instead of spending
+    searches on discovery; never verification by itself."""
     excluded = "\n".join(f"- {n}" for n in excluded_names) or "(none)"
     # Candidate-specific but company-independent — identical on every
     # identify_contact call in this run (primary + backup, every company),
@@ -166,10 +173,21 @@ async def identify_contact(
         f"Candidate's target role/industry: {candidate.target_industry_role or 'see resume'}\n\n"
         f"Candidate summary (for relevance):\n{candidate.resume_text[:3000]}"
     )
+    leads_block = ""
+    if leads:
+        leads_block = (
+            "\n\nContacts Hunter's database lists at this domain (leads to"
+            " verify, not verification — see system prompt):\n"
+            + "\n".join(
+                f"- {p['name']}" + (f" — {p['title']}" if p.get("title") else "")
+                for p in leads
+            )
+        )
     user = (
         f"Company: {company_name} ({domain})\n\n"
-        f"Excluded contacts (do not pick these):\n{excluded}\n\n"
-        "Identify the single best contact."
+        f"Excluded contacts (do not pick these):\n{excluded}"
+        f"{leads_block}\n\n"
+        "Identify the best contact (and an opportunistic fallback, per the system prompt)."
     )
     async def _call(max_uses: int, timeout_seconds: int):
         return await ask_json(
@@ -200,20 +218,30 @@ async def identify_contact(
             config.settings.CONTACT_TIMEOUT_RETRY_MAX_USES,
             config.settings.CONTACT_TIMEOUT_RETRY_TIMEOUT_SECONDS,
         )
-    contact = Contact.from_dict(raw)
-    # Anti-fabrication gate: a LinkedIn URL without provenance (which search
-    # result showed it) is a guessed slug until proven otherwise — real runs
-    # shipped plausible-looking /in/first-last URLs that belonged to strangers.
-    # Better no link (the UI can fall back to a LinkedIn search) than a wrong
-    # person's profile presented as fact.
-    if contact and contact.linkedin_url and isinstance(raw, dict):
-        if not str(raw.get("linkedin_url_source", "")).strip():
+    def _parse(person_raw) -> Optional[Contact]:
+        if not isinstance(person_raw, dict):
+            return None
+        contact = Contact.from_dict(person_raw)
+        # Empty-name sentinel: the schema requires the fallback object, so
+        # "none surfaced" arrives as all-empty fields (see CONTACT_SCHEMA).
+        if not contact or not contact.full_name:
+            return None
+        # Anti-fabrication gate: a LinkedIn URL without provenance (which
+        # search result showed it) is a guessed slug until proven otherwise —
+        # real runs shipped plausible-looking /in/first-last URLs that
+        # belonged to strangers. Better no link (the UI can fall back to a
+        # LinkedIn search) than a wrong person's profile presented as fact.
+        if contact.linkedin_url and not str(person_raw.get("linkedin_url_source", "")).strip():
             logger.info(
                 "%s: dropping unsourced LinkedIn URL %s (no search result cited)",
                 label, contact.linkedin_url,
             )
             contact.linkedin_url = ""
-    return contact
+        return contact
+
+    if not isinstance(raw, dict):
+        return None, None
+    return _parse(raw.get("primary")), _parse(raw.get("fallback"))
 
 
 async def lookup_email(

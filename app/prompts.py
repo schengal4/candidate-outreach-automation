@@ -80,6 +80,10 @@ Calibrate seniority to company size (use web search to gauge headcount when unsu
 
 Your web-search budget is small (about 5 searches) — budget it deliberately. The seniority calibration is a preference, not a gate: if you cannot identify AND verify the ideal-level contact within budget, return the best hiring-relevant person you DID verify, even if they are more senior than ideal. A verified, hiring-relevant contact always beats an unverifiable perfect fit.
 
+The user message may list contacts Hunter's database already associates with this domain (names and titles). Treat them as LEADS: a head start on who exists and roughly what they do, subject to the same aggregator rule as any directory data below — a lead listing can point you at a person but can NEVER by itself make employment_verified true, and its title may be stale. When a lead matches the right seniority, verifying that person is usually a better use of a search than discovering someone from scratch; ignore leads that are clearly the wrong function or level.
+
+Report a fallback contact too. While researching the primary, a second hiring-relevant person usually surfaces in the SAME results (team pages and leadership articles list several names). Fill in fallback with the best such person, applying every rule in this prompt to whatever evidence those results already gave you — but do NOT spend extra searches specifically to find or verify a fallback; it is an opportunistic byproduct, used only when the primary's email can't be found. If no second person surfaced, set every fallback string field to "" and its employment_verified to false.
+
 Employment verification (the employment_verified field):
 - Set it true only on dated evidence found via web search that the person still works there: a recent post, a dated article, an updated profile/title with a source date. No dated evidence → false. Do not guess or infer, and do not keep searching past your budget hoping for verification — return your best candidate with employment_verified false instead.
 - Source quality matters as much as dates. The company's own leadership/about page, a dated press release or news article, or the person's own recent posts can verify employment. Directory and aggregator sites (TheOrg, ZoomInfo, RocketReach, Comparably, ContactOut, Apollo, and similar) republish stale data and go wrong silently — they can point you at a lead, but they can NEVER be the sole basis for employment_verified true.
@@ -93,7 +97,7 @@ LinkedIn URL: set linkedin_url ONLY to a URL that appeared verbatim in one of yo
 
 If the user message lists excluded contacts, do not pick any of them."""
 
-CONTACT_SCHEMA = {
+_CONTACT_PERSON_SCHEMA = {
     "type": "object",
     "properties": {
         "first_name": {"type": "string"},
@@ -113,6 +117,20 @@ CONTACT_SCHEMA = {
         "first_name", "last_name", "title", "linkedin_url", "linkedin_url_source",
         "employment_verified", "evidence", "verification_caveat",
     ],
+    "additionalProperties": False,
+}
+
+# primary + an opportunistic fallback from the SAME searches (see prompt) —
+# a real run spent a full second identification call on 5 of 12 companies
+# re-deriving org facts the primary call had already seen. An all-empty
+# fallback (first_name == "") means none surfaced.
+CONTACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "primary": _CONTACT_PERSON_SCHEMA,
+        "fallback": _CONTACT_PERSON_SCHEMA,
+    },
+    "required": ["primary", "fallback"],
     "additionalProperties": False,
 }
 
